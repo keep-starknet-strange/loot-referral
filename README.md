@@ -36,29 +36,10 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 VERIFY_API_KEY=your_verify_endpoint_secret
 NEXT_PUBLIC_LOOT_SURVIVOR_CONTRACT=0x0100000000000000000000000000000000000000000000000000000000000000
-STARKSCAN_API_KEY=your_starkscan_api_key
 NEXT_PUBLIC_STARKNET_CHAIN=mainnet
 ```
 
-### 3. Database Setup
-
-Run the migration SQL in your Supabase SQL editor:
-
-```sql
--- See supabase/migrations/001_create_referrals_table.sql
-```
-
-Or execute it via Supabase dashboard:
-1. Go to your Supabase project
-2. Navigate to SQL Editor
-3. Copy and paste the contents of `supabase/migrations/001_create_referrals_table.sql`
-4. Run the migration
-
-### 3b. Lock down direct Supabase access (recommended)
-
-To ensure the public `anon` key cannot read/write referral data directly, run:
-
-- `supabase/SECURITY_SETUP.sql`
+### 3 . Create Supabase database
 
 ### 4. Run Development Server
 
