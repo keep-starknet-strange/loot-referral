@@ -186,11 +186,6 @@ The wallet connection component:
 - Automatically submits referral when wallet connects
 - Handles connect/disconnect events
 
-## Starkscan API
-
-The verification system uses Starkscan API to check for on-chain activity. You can get an API key from [Starkscan](https://starkscan.co/).
-
-**Note**: The API key is optional but recommended to avoid rate limits.
 
 ## Security Considerations
 
@@ -198,16 +193,6 @@ The verification system uses Starkscan API to check for on-chain activity. You c
 2. **Rate Limiting**: Implement rate limiting on referral creation
 3. **Input Validation**: Address format validation is already implemented
 4. **Self-Referral Prevention**: The system prevents users from referring themselves
-
-## Future Enhancements
-
-- [ ] Add authentication/authorization
-- [ ] Implement rate limiting
-- [ ] Add email notifications for referrals
-- [ ] Create admin dashboard
-- [ ] Add referral analytics
-- [ ] Support multiple games/contracts
-- [ ] Add referral rewards system
 
 ## License
 
