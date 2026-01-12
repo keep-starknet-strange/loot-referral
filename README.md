@@ -7,7 +7,7 @@ A referral tracking system for Loot Survivor on Starknet. Track which players br
 - 🔗 **Referral Link Capture**: Automatically captures referral addresses from URL parameters
 - 💾 **LocalStorage Persistence**: Saves referral data until wallet connection
 - 🔐 **Wallet Integration**: Cartridge Controller (Starknet) wallet connection
-- ✅ **On-Chain Verification**: Verifies actual gameplay via Starkscan API
+- ✅ **On-Chain Verification**: Verifies actual gameplay via Starknet RPC
 - 📊 **Leaderboard**: Real-time leaderboard showing top referrers
 - 🎨 **Dark Theme UI**: Modern, clean interface with Tailwind CSS
 
