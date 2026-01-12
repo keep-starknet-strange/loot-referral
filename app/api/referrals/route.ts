@@ -2,6 +2,68 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getClientIp, rateLimit } from '@/lib/rateLimit';
 
+const STARKNET_RPC_URL = process.env.STARKNET_RPC;
+
+if (!STARKNET_RPC_URL) {
+  throw new Error(
+    'Missing STARKNET_RPC environment variable. ' +
+    'This server-only variable is required for referral creation. ' +
+    'Add it to your .env.local file (without NEXT_PUBLIC_ prefix).'
+  );
+}
+
+// TypeScript assertion: STARKNET_RPC_URL is guaranteed to be defined after the check above
+const STARKNET_RPC: string = STARKNET_RPC_URL;
+
+function parseBlockNumber(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return null;
+
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (v.startsWith('0x')) {
+    const n = parseInt(v, 16);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d+$/.test(v)) {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^[0-9a-f]+$/.test(v)) {
+    const n = parseInt(`0x${v}`, 16);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+async function rpcRequest<T = any>(method: string, params: any[]): Promise<T> {
+  const response = await fetch(STARKNET_RPC, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`[REFERRAL] RPC ${method} failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payload = await response.json();
+  if (payload?.error) {
+    throw new Error(`[REFERRAL] RPC ${method} error: ${JSON.stringify(payload.error)}`);
+  }
+  return payload?.result as T;
+}
+
+async function getLatestBlockNumber(): Promise<number> {
+  const result: any = await rpcRequest('starknet_blockHashAndNumber', []);
+  const blockNumber = parseBlockNumber(result?.block_number ?? result);
+  if (blockNumber === null) {
+    throw new Error(`[REFERRAL] Unexpected blockHashAndNumber result: ${JSON.stringify(result)}`);
+  }
+  return blockNumber;
+}
+
 /**
  * POST /api/referrals
  * Create a new referral mapping
@@ -56,6 +118,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Get current block number to ensure we only count games played AFTER referral creation
+    const currentBlock = await getLatestBlockNumber();
+    console.log(`[REFERRAL] Creating referral at block ${currentBlock}`);
+
     // Insert referral mapping
     const { data, error } = await supabaseAdmin
       .from('referrals')
@@ -63,6 +129,7 @@ export async function POST(request: NextRequest) {
         referee_address: referee_address.toLowerCase(),
         referrer_address: referrer_address.toLowerCase(),
         has_played: false,
+        last_checked_block: currentBlock,  // Set to current block, not 0!
       })
       .select()
       .single();
