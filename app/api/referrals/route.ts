@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getClientIp, rateLimit } from '@/lib/rateLimit';
+import { lookupAddresses } from '@cartridge/controller';
 
 const STARKNET_RPC_URL = process.env.STARKNET_RPC;
 
@@ -122,12 +123,28 @@ export async function POST(request: NextRequest) {
     const currentBlock = await getLatestBlockNumber();
     console.log(`[REFERRAL] Creating referral at block ${currentBlock}`);
 
+    // Lookup usernames for both referee and referrer
+    let referee_username: string | undefined;
+    let referrer_username: string | undefined;
+    
+    try {
+      const addressMap = await lookupAddresses([referee_address, referrer_address]);
+      referee_username = addressMap.get(referee_address) || undefined;
+      referrer_username = addressMap.get(referrer_address) || undefined;
+      console.log(`[REFERRAL] Username lookup: referee="${referee_username}", referrer="${referrer_username}"`);
+    } catch (usernameError) {
+      // Log but don't fail - usernames are optional
+      console.warn('[REFERRAL] Failed to lookup usernames:', usernameError);
+    }
+
     // Insert referral mapping
     const { data, error } = await supabaseAdmin
       .from('referrals')
       .insert({
         referee_address: referee_address.toLowerCase(),
         referrer_address: referrer_address.toLowerCase(),
+        referee_username,
+        referrer_username,
         has_played: false,
         last_checked_block: currentBlock,  // Set to current block, not 0!
       })
@@ -169,11 +186,11 @@ export async function GET(request: NextRequest) {
       // - cached at CDN (s-maxage)
       // - only aggregated output (no raw rows)
 
-      // Get leaderboard data with games_played
+      // Get leaderboard data with games_played and usernames
       // Filter for referrals that have actually played (has_played = true) and have games_played > 0
       const { data, error } = await supabaseAdmin
         .from('referrals')
-        .select('referrer_address, games_played')
+        .select('referrer_address, referrer_username, games_played')
         .eq('has_played', true)
         .gt('games_played', 0)
         .not('referrer_address', 'is', null);
@@ -183,7 +200,7 @@ export async function GET(request: NextRequest) {
       // Aggregate by referrer_address (normalize to lowercase for consistent grouping)
       // Calculate points using formula: P = Σ(G_i)^1.3
       // where G_i is the number of games played by each referee
-      const leaderboardMap = new Map<string, { players: number; points: number; referrer_address: string }>();
+      const leaderboardMap = new Map<string, { players: number; points: number; referrer_address: string; referrer_username?: string }>();
       
       data?.forEach((ref) => {
         const gamesPlayed = ref.games_played || 0;
@@ -199,20 +216,23 @@ export async function GET(request: NextRequest) {
             players: existing.players + 1,
             points: existing.points + points,
             referrer_address: existing.referrer_address, // Keep original case from first entry
+            referrer_username: existing.referrer_username || ref.referrer_username, // Use first non-null username
           });
         } else {
           leaderboardMap.set(normalizedReferrer, {
             players: 1,
             points: points,
             referrer_address: ref.referrer_address, // Keep original case
+            referrer_username: ref.referrer_username,
           });
         }
       });
 
       // Convert to array and sort by points (descending)
       const leaderboardData = Array.from(leaderboardMap.values())
-        .map(({ players, points, referrer_address }) => ({
+        .map(({ players, points, referrer_address, referrer_username }) => ({
           referrer_address,
+          referrer_username,
           total_points: players, // Keep this for backward compatibility (players onboarded)
           points: Math.round(points * 100) / 100, // Round to 2 decimal places
         }))
