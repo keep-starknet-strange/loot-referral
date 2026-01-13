@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getClientIp, rateLimit } from '@/lib/rateLimit';
+import { lookupAddresses } from '@cartridge/controller';
 
 // Server-only environment variables (not exposed to client)
 const LOOT_SURVIVOR_CONTRACT = process.env.NEXT_PUBLIC_LOOT_SURVIVOR_CONTRACT || '0x06f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c';
@@ -609,10 +610,116 @@ export async function POST(request: NextRequest) {
     const totalUpdated = unverifiedUpdated + verifiedUpdated;
     const totalProcessed = (unverifiedReferrals?.length || 0) + (verifiedReferrals?.length || 0);
 
+    // Step 7: Update missing usernames
+    logSensitive(`[VERIFY] Step 7: Checking for referrals without usernames...`);
+    let usernamesUpdated = 0;
+    
+    try {
+      const { data: referralsWithoutUsernames, error: usernameQueryError } = await supabaseAdmin
+        .from('referrals')
+        .select('id, referee_address, referrer_address, referee_username, referrer_username')
+        .or('referee_username.is.null,referrer_username.is.null');
+
+      if (usernameQueryError) {
+        logError('[VERIFY] Error fetching referrals without usernames:', usernameQueryError);
+      } else if (referralsWithoutUsernames && referralsWithoutUsernames.length > 0) {
+        logSensitive(`[VERIFY] Found ${referralsWithoutUsernames.length} referrals with missing usernames`);
+        
+        // Collect all unique addresses that need username lookup
+        const addressesToLookup = new Set<string>();
+        referralsWithoutUsernames.forEach(ref => {
+          if (!ref.referee_username && ref.referee_address) {
+            addressesToLookup.add(ref.referee_address.toLowerCase());
+          }
+          if (!ref.referrer_username && ref.referrer_address) {
+            addressesToLookup.add(ref.referrer_address.toLowerCase());
+          }
+        });
+
+        if (addressesToLookup.size > 0) {
+          logSensitive(`[VERIFY] Looking up usernames for ${addressesToLookup.size} addresses...`);
+          
+          try {
+            const addressMap = await lookupAddresses(Array.from(addressesToLookup));
+            logSensitive(`[VERIFY] Username lookup complete, found ${addressMap.size} usernames`);
+
+            // Create a normalized map for better matching
+            // The Cartridge API might return addresses without leading zeros
+            const normalizedMap = new Map<string, string>();
+            for (const [addr, username] of addressMap.entries()) {
+              // Store both original and normalized (with leading 0x but without zero padding)
+              const normalized = normalizeFeltHex(addr);
+              if (normalized) {
+                normalizedMap.set(normalized.toLowerCase(), username);
+              }
+              normalizedMap.set(addr.toLowerCase(), username);
+            }
+
+            logSensitive(`[VERIFY] Normalized ${normalizedMap.size} address mappings`);
+
+            // Update each referral with missing usernames
+            for (const ref of referralsWithoutUsernames) {
+              const updates: { referee_username?: string; referrer_username?: string } = {};
+              let needsUpdate = false;
+
+              if (!ref.referee_username && ref.referee_address) {
+                // Try both original and normalized versions
+                const refAddr = ref.referee_address.toLowerCase();
+                const refNorm = normalizeFeltHex(ref.referee_address);
+                const username = normalizedMap.get(refAddr) || (refNorm ? normalizedMap.get(refNorm.toLowerCase()) : undefined);
+                if (username) {
+                  updates.referee_username = username;
+                  needsUpdate = true;
+                  logSensitive(`[VERIFY] Matched referee username: ${username} for ${ref.referee_address}`);
+                }
+              }
+
+              if (!ref.referrer_username && ref.referrer_address) {
+                // Try both original and normalized versions
+                const rerrAddr = ref.referrer_address.toLowerCase();
+                const rerrNorm = normalizeFeltHex(ref.referrer_address);
+                const username = normalizedMap.get(rerrAddr) || (rerrNorm ? normalizedMap.get(rerrNorm.toLowerCase()) : undefined);
+                if (username) {
+                  updates.referrer_username = username;
+                  needsUpdate = true;
+                  logSensitive(`[VERIFY] Matched referrer username: ${username} for ${ref.referrer_address}`);
+                }
+              }
+
+              if (needsUpdate) {
+                const { error: updateError } = await supabaseAdmin
+                  .from('referrals')
+                  .update(updates)
+                  .eq('id', ref.id);
+
+                if (updateError) {
+                  logError(`[VERIFY] Error updating usernames for referral ${ref.id}:`, updateError);
+                } else {
+                  usernamesUpdated++;
+                  logSensitive(`[VERIFY] Updated usernames for referral ${ref.id}`);
+                }
+              }
+            }
+
+            logSensitive(`[VERIFY] Username update complete: ${usernamesUpdated} referrals updated`);
+          } catch (lookupError: any) {
+            logError('[VERIFY] Error during username lookup:', lookupError);
+          }
+        } else {
+          logSensitive(`[VERIFY] No addresses need username lookup`);
+        }
+      } else {
+        logSensitive(`[VERIFY] All referrals already have usernames`);
+      }
+    } catch (error: any) {
+      logError('[VERIFY] Error in username update step:', error);
+    }
+
     const result = {
-      message: `Processed ${totalProcessed} referrals. Updated ${totalUpdated} game counts. ${newlyVerified} newly verified.`,
+      message: `Processed ${totalProcessed} referrals. Updated ${totalUpdated} game counts. ${newlyVerified} newly verified. ${usernamesUpdated} usernames updated.`,
       newlyVerified,
       updated: totalUpdated,
+      usernamesUpdated,
       unverifiedProcessed: unverifiedReferrals?.length || 0,
       verifiedProcessed: verifiedReferrals?.length || 0,
       total: totalProcessed,
