@@ -2,15 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { Trophy, Users } from 'lucide-react';
-import { lookupAddresses } from '@cartridge/controller';
-import { num } from 'starknet';
 
 interface LeaderboardEntry {
   rank: number;
   referrer_address: string;
+  referrer_username?: string; // Username from database (looked up server-side)
   total_points: number; // Players onboarded
   points: number; // Calculated points using formula
-  username?: string;
 }
 
 export function ReferralLeaderboard() {
@@ -44,53 +42,9 @@ export function ReferralLeaderboard() {
 
       const { data } = await response.json();
       
-      // Fetch usernames for all addresses
-      if (data && data.length > 0) {
-        try {
-          // Get all unique addresses
-          const addresses = data.map((entry: LeaderboardEntry) => 
-            entry.referrer_address.toLowerCase().trim()
-          );
-          
-          console.log('Fetching usernames for addresses:', addresses);
-          
-          // lookupAddresses normalizes addresses using num.toHex internally
-          const usernameMap = await lookupAddresses(addresses);
-          
-          console.log('Username map received:', Array.from(usernameMap.entries()));
-          
-          // Add usernames to leaderboard entries
-          // The lookupAddresses function normalizes addresses with num.toHex,
-          // so we need to normalize our addresses the same way for lookup
-          const leaderboardWithUsernames = data.map((entry: LeaderboardEntry) => {
-            const normalizedAddress = num.toHex(entry.referrer_address.toLowerCase().trim());
-            const originalAddress = entry.referrer_address.toLowerCase().trim();
-            
-            // Try normalized first (how lookupAddresses stores it), then original
-            const username = usernameMap.get(normalizedAddress) || 
-                           usernameMap.get(originalAddress) ||
-                           undefined;
-            
-            console.log(`Entry: ${entry.referrer_address}, Normalized: ${normalizedAddress}, Username: ${username || 'NOT FOUND'}`);
-            
-            return {
-              ...entry,
-              username,
-            };
-          });
-          
-          console.log('Leaderboard with usernames:', leaderboardWithUsernames);
-          setLeaderboard(leaderboardWithUsernames);
-        } catch (usernameError) {
-          // If username lookup fails, still show the leaderboard with addresses
-          console.error('Failed to fetch usernames:', usernameError);
-          console.error('Error details:', usernameError);
-          setLeaderboard(data || []);
-        }
-      } else {
-        setLeaderboard(data || []);
-      }
-      
+      // Usernames are now included in the API response (looked up server-side)
+      // No need to fetch them separately on the client
+      setLeaderboard(data || []);
       setError(null);
     } catch (err: any) {
       setError(err.message);
@@ -175,9 +129,9 @@ export function ReferralLeaderboard() {
                     </div>
                   </td>
                   <td className="py-3 sm:py-4 px-2 sm:px-4">
-                    {entry.username ? (
+                    {entry.referrer_username ? (
                       <span className="text-white font-medium text-xs sm:text-sm">
-                        {entry.username}
+                        {entry.referrer_username}
                       </span>
                     ) : (
                       <code className="text-gray-300 font-mono text-xs sm:text-sm">
