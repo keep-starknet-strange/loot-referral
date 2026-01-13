@@ -62,6 +62,8 @@ type ReferralRow = {
   id: string;
   referee_address: string;
   referrer_address?: string;
+  referee_username?: string;
+  referrer_username?: string;
   created_at: string;
   has_played?: boolean;
   last_checked_block?: number;
@@ -669,4 +671,3 @@ export async function GET() {
     );
   }
 }
-
