@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { POST as verifyPOST } from '../../verify/route';
 
 /**
  * Cron job endpoint for Vercel
  * This endpoint is called by Vercel's cron service
  * It validates the Vercel cron secret and then triggers verification
+ * 
+ * Note: We directly import and call the verification logic instead of making
+ * an HTTP request to avoid issues with Vercel's deployment protection.
  */
 export async function GET(request: NextRequest) {
   try {
@@ -29,7 +33,7 @@ export async function GET(request: NextRequest) {
 
     console.log('[CRON] Triggering verification from cron job...');
 
-    // Call the verification API internally
+    // Create a mock request with the VERIFY_API_KEY header
     const verifyApiKey = process.env.VERIFY_API_KEY;
     if (!verifyApiKey) {
       console.error('[CRON] VERIFY_API_KEY not configured');
@@ -39,42 +43,36 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Get the base URL for the API call
-    const baseUrl = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : request.nextUrl.origin;
-
-    const verifyUrl = `${baseUrl}/api/verify`;
-    console.log(`[CRON] Calling ${verifyUrl}`);
-
-    const response = await fetch(verifyUrl, {
+    // Create a new request with the verify API key header
+    const verifyRequest = new NextRequest(new URL('/api/verify', request.url), {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
         'x-verify-key': verifyApiKey,
       },
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[CRON] Verification failed: ${response.status}`, errorText);
+    // Call the verification function directly
+    const result = await verifyPOST(verifyRequest);
+    const resultData = await result.json();
+
+    if (!result.ok) {
+      console.error(`[CRON] Verification failed: ${result.status}`, resultData);
       return NextResponse.json(
         { 
           error: 'Verification failed',
-          status: response.status,
-          details: errorText
+          status: result.status,
+          details: resultData
         },
-        { status: response.status }
+        { status: result.status }
       );
     }
 
-    const result = await response.json();
-    console.log('[CRON] Verification completed successfully:', result);
+    console.log('[CRON] Verification completed successfully:', resultData);
 
     return NextResponse.json({
       success: true,
       timestamp: new Date().toISOString(),
-      result,
+      result: resultData,
     });
   } catch (error: any) {
     console.error('[CRON] Error in cron job:', error);
