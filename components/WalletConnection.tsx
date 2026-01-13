@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useCallback, useRef } from 'react';
+import { useEffect, useCallback, useRef, useState } from 'react';
 import { Wallet, LogOut } from 'lucide-react';
 import { useReferral } from '@/hooks/useReferral';
 import { 
@@ -22,6 +22,15 @@ export function WalletConnection({ onAddressChange }: WalletConnectionProps) {
   
   // Track if we've already submitted referral for this address to prevent duplicates
   const submittedAddressRef = useRef<string | null>(null);
+  
+  // Store username for connected wallet
+  const [username, setUsername] = useState<string | null>(null);
+  
+  // Track connection loading state
+  const [isConnecting, setIsConnecting] = useState(false);
+  
+  // Track username loading state
+  const [isLoadingUsername, setIsLoadingUsername] = useState(false);
 
   // Get the Controller connector (should be the first/only connector)
   // Note: Connector may not be available until user clicks "Connect Wallet"
@@ -37,6 +46,9 @@ export function WalletConnection({ onAddressChange }: WalletConnectionProps) {
   // Close Cartridge Controller modal after successful connection
   useEffect(() => {
     if (isConnected && address) {
+      // Reset loading state when connected
+      setIsConnecting(false);
+      
       // The modal should close automatically, but if it doesn't, try to close it
       // Cartridge Controller modal is in an iframe, so we can't directly control it
       // But we can try to remove the modal container if it's still visible
@@ -296,60 +308,118 @@ export function WalletConnection({ onAddressChange }: WalletConnectionProps) {
   useEffect(() => {
     if (!isConnected) {
       submittedAddressRef.current = null;
+      setUsername(null); // Also reset username
+      setIsLoadingUsername(false); // Reset loading state
     }
   }, [isConnected]);
+
+  // Fetch username when address changes
+  useEffect(() => {
+    let mounted = true;
+
+    const fetchUsername = async () => {
+      if (!address) {
+        setUsername(null);
+        setIsLoadingUsername(false);
+        return;
+      }
+
+      setIsLoadingUsername(true);
+      try {
+        const response = await fetch(`/api/username?address=${address}`);
+        if (!response.ok) {
+          console.warn('Failed to fetch username');
+          setIsLoadingUsername(false);
+          return;
+        }
+
+        const data = await response.json();
+        if (mounted) {
+          if (data.username) {
+            setUsername(data.username);
+          }
+          setIsLoadingUsername(false);
+        }
+      } catch (error) {
+        console.error('Error fetching username:', error);
+        if (mounted) {
+          setIsLoadingUsername(false);
+        }
+      }
+    };
+
+    fetchUsername();
+
+    return () => {
+      mounted = false;
+    };
+  }, [address]);
 
   const { setConnectors } = useConnectorContext();
 
   const handleConnect = useCallback(async () => {
-    // Initialize connector only when user clicks the button
-    // This prevents WASM from loading until explicitly requested
-    let connectorToUse = controllerConnector;
+    setIsConnecting(true);
+    try {
+      // Initialize connector only when user clicks the button
+      // This prevents WASM from loading until explicitly requested
+      let connectorToUse = controllerConnector;
 
-    // If connector is not available, initialize it now
-    if (!connectorToUse) {
-      try {
-        // Try synchronous first (works for Safari)
-        const newConnector = getControllerConnector();
-        
-        // If not available, use async initialization (better for Chrome)
-        const initializedConnector = newConnector || await initializeControllerConnectorAsync();
+      // If connector is not available, initialize it now
+      if (!connectorToUse) {
+        try {
+          // Try synchronous first (works for Safari)
+          const newConnector = getControllerConnector();
+          
+          // If not available, use async initialization (better for Chrome)
+          const initializedConnector = newConnector || await initializeControllerConnectorAsync();
 
-        if (!initializedConnector) {
-          console.error('Failed to initialize Controller connector');
+          if (!initializedConnector) {
+            console.error('Failed to initialize Controller connector');
+            return;
+          }
+
+          // Register the connector with StarknetConfig
+          setConnectors([initializedConnector]);
+          
+          // Wait a moment for the connector to be registered in the context
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+          connectorToUse = initializedConnector;
+        } catch (err) {
+          console.error('Error initializing connector:', err);
           return;
         }
+      }
 
-        // Register the connector with StarknetConfig
-        setConnectors([initializedConnector]);
-        
-        // Wait a moment for the connector to be registered in the context
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-        connectorToUse = initializedConnector;
-      } catch (err) {
-        console.error('Error initializing connector:', err);
+      if (!connectorToUse) {
+        console.error('Controller connector not found');
         return;
       }
-    }
 
-    if (!connectorToUse) {
-      console.error('Controller connector not found');
-      return;
-    }
-
-    try {
-      await connect({ connector: connectorToUse });
-    } catch (err) {
-      console.error('Error connecting wallet:', err);
+      try {
+        await connect({ connector: connectorToUse });
+      } catch (err) {
+        console.error('Error connecting wallet:', err);
+      }
+    } finally {
+      setIsConnecting(false);
     }
   }, [connect, controllerConnector, setConnectors]);
 
   const handleDisconnect = useCallback(async () => {
     try {
       await disconnect();
-    } catch (err) {
-      console.error('Error disconnecting wallet:', err);
+    } catch (err: any) {
+      // Silently handle "destroyed connection" errors as they're expected
+      if (err?.message?.includes('destroyed connection')) {
+        console.debug('Connection already destroyed, clearing state');
+      } else {
+        console.error('Error disconnecting wallet:', err);
+      }
+    } finally {
+      // Always reset local state, even if disconnect fails
+      setUsername(null);
+      submittedAddressRef.current = null;
     }
   }, [disconnect]);
 
@@ -366,11 +436,43 @@ export function WalletConnection({ onAddressChange }: WalletConnectionProps) {
             <div className="w-2 h-2 bg-dungeon-green-glow rounded-full flex-shrink-0 animate-pulse"></div>
             <div>
               <p className="text-xs text-dungeon-text">Connected</p>
-              <p className="text-xs sm:text-sm font-mono text-dungeon-text break-all sm:break-normal">{truncateAddress(address)}</p>
+              {isLoadingUsername ? (
+                <>
+                  <p className="text-xs sm:text-sm text-dungeon-text flex items-center">
+                    <span>Username: </span>
+                    <span className="inline-flex ml-0.5">
+                      <span className="animate-bounce" style={{ animationDelay: '0ms' }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: '150ms' }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: '300ms' }}>.</span>
+                    </span>
+                  </p>
+                  <p className="text-xs sm:text-sm text-dungeon-text">
+                    Address: <span className="font-mono">{truncateAddress(address)}</span>
+                  </p>
+                </>
+              ) : username ? (
+                <>
+                  <p className="text-xs sm:text-sm text-dungeon-text">
+                    Username: <span className="font-medium text-white">{username}</span>
+                  </p>
+                  <p className="text-xs sm:text-sm text-dungeon-text">
+                    Address: <span className="font-mono">{truncateAddress(address)}</span>
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs sm:text-sm text-dungeon-text">
+                  Address: <span className="font-mono">{truncateAddress(address)}</span>
+                </p>
+              )}
             </div>
           </div>
           <button
-            onClick={handleDisconnect}
+            onClick={(e) => {
+              e.preventDefault();
+              handleDisconnect().catch((err) => {
+                console.debug('Disconnect error caught:', err);
+              });
+            }}
             className="w-full sm:w-auto px-3 py-1.5 bg-dungeon-green-light hover:bg-dungeon-green-light/80 text-white rounded-lg transition-colors flex items-center justify-center gap-2 text-sm"
           >
             <LogOut className="w-4 h-4" />
@@ -385,10 +487,24 @@ export function WalletConnection({ onAddressChange }: WalletConnectionProps) {
     <div className="bg-dungeon-green rounded-lg border border-dungeon-border p-3 sm:p-4">
       <button
         onClick={handleConnect}
-        className="w-full px-4 py-2 sm:py-3 bg-dungeon-button hover:bg-dungeon-button/90 text-black font-bold rounded-lg transition-colors flex items-center justify-center gap-2 text-sm sm:text-base shadow-lg"
+        disabled={isConnecting}
+        className="w-full px-4 py-2 sm:py-3 bg-dungeon-button hover:bg-dungeon-button/90 text-black font-bold rounded-lg transition-colors flex items-center justify-center gap-2 text-sm sm:text-base shadow-lg disabled:opacity-70 disabled:cursor-not-allowed"
       >
-        <Wallet className="w-4 h-4" />
-        Connect Wallet
+        {isConnecting ? (
+          <span className="flex items-center">
+            Connecting
+            <span className="inline-flex ml-0.5">
+              <span className="animate-bounce" style={{ animationDelay: '0ms' }}>.</span>
+              <span className="animate-bounce" style={{ animationDelay: '150ms' }}>.</span>
+              <span className="animate-bounce" style={{ animationDelay: '300ms' }}>.</span>
+            </span>
+          </span>
+        ) : (
+          <>
+            <Wallet className="w-4 h-4" />
+            Connect Wallet
+          </>
+        )}
       </button>
     </div>
   );
