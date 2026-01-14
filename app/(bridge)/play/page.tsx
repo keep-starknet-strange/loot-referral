@@ -7,13 +7,19 @@ import {
   useDisconnect, 
   useAccount,
 } from '@starknet-react/core';
-import { useConnectorContext, initializeControllerConnectorAsync, getControllerConnector } from '@/providers/StarknetProvider';
+import {
+  useConnectorContext,
+  initializeControllerConnectorAsync,
+  getControllerConnector,
+  resetControllerConnector,
+} from '@/providers/StarknetProvider';
 
 type LoadingState = 'idle' | 'connecting' | 'saving' | 'redirecting';
 
 export default function PlayPage() {
-  const { referralAddress, submitReferral, isProcessing } = useReferral();
+  const { referralAddress, submitReferral } = useReferral();
   const { connect, connectors } = useConnect();
+  const { disconnect } = useDisconnect();
   const { address, isConnected } = useAccount();
   const { setConnectors } = useConnectorContext();
   
@@ -67,10 +73,77 @@ export default function PlayPage() {
     }
   }, [isConnected, address, handleReferralAndRedirect]);
 
+  const resetFailedConnectAttempt = useCallback(async () => {
+    try {
+      await disconnect();
+    } catch {
+      // ignore
+    }
+    resetControllerConnector();
+    setConnectors([]);
+  }, [disconnect, setConnectors]);
+
+  // If the user closes the Controller modal without completing the flow, reset so they can retry.
+  useEffect(() => {
+    if (loadingState !== 'connecting') return;
+    if (isConnected) return;
+
+    let cancelled = false;
+    let sawModal = false;
+    const startedAt = Date.now();
+    const poll = setInterval(() => {
+      if (cancelled) return;
+      if (isConnected) return;
+
+      const controllerElement = document.getElementById('controller');
+      const iframe = controllerElement?.querySelector('iframe[id^="controller-"]');
+
+      const hasModalOpen =
+        !!controllerElement &&
+        controllerElement.style.display !== 'none' &&
+        controllerElement.style.visibility !== 'hidden' &&
+        controllerElement.style.opacity !== '0' &&
+        !!iframe;
+
+      const timedOut = Date.now() - startedAt > 60_000;
+
+      if (hasModalOpen) {
+        sawModal = true;
+        return;
+      }
+
+      if ((sawModal && !isConnected) || timedOut) {
+        cancelled = true;
+        setLoadingState('idle');
+        resetFailedConnectAttempt();
+        clearInterval(poll);
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearInterval(poll);
+    };
+  }, [loadingState, isConnected, resetFailedConnectAttempt]);
+
   // Handle wallet connection
   const handleConnect = useCallback(async () => {
     setLoadingState('connecting');
     
+    // Remove stale/hidden controller container before starting a new connect.
+    const existingController = document.getElementById('controller');
+    if (existingController && !isConnected) {
+      const isHidden =
+        existingController.style.display === 'none' ||
+        existingController.style.visibility === 'hidden' ||
+        existingController.style.opacity === '0' ||
+        existingController.style.pointerEvents === 'none';
+      const hasIframe = !!existingController.querySelector('iframe[id^="controller-"]');
+      if (isHidden || !hasIframe) {
+        existingController.remove();
+      }
+    }
+
     let connectorToUse = controllerConnector;
 
     // If connector is not available, initialize it now
@@ -106,9 +179,29 @@ export default function PlayPage() {
       // The useEffect will handle the referral and redirect after connection
     } catch (err) {
       console.error('Error connecting wallet:', err);
+      const message = err instanceof Error ? err.message : String(err ?? '');
+      const retry =
+        message.toLowerCase().includes('destroyed connection') ||
+        message.toLowerCase().includes('account not initialized');
+
+      await resetFailedConnectAttempt();
+
+      if (retry) {
+        try {
+          const fresh = getControllerConnector() || (await initializeControllerConnectorAsync());
+          if (fresh) {
+            setConnectors([fresh]);
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            await connect({ connector: fresh });
+          }
+        } catch (retryErr) {
+          console.error('Retry connect failed:', retryErr);
+        }
+      }
+
       setLoadingState('idle');
     }
-  }, [connect, controllerConnector, setConnectors]);
+  }, [connect, controllerConnector, initializeControllerConnectorAsync, isConnected, resetFailedConnectAttempt, setConnectors]);
 
   // Handle button click for already connected users
   const handleResumeAdventure = useCallback(async () => {
@@ -165,7 +258,7 @@ export default function PlayPage() {
         {/* Main Button */}
         <button
           onClick={handleButtonClick}
-          disabled={loadingState !== 'idle' && loadingState !== 'connecting'}
+          disabled={loadingState !== 'idle'}
           className="px-12 py-6 md:px-16 md:py-8 bg-dungeon-yellow hover:bg-dungeon-yellow-dark text-black text-xl md:text-2xl font-bold rounded-lg shadow-2xl transform transition-all duration-200 hover:scale-105 active:scale-95 disabled:opacity-70 disabled:cursor-not-allowed disabled:transform-none relative overflow-hidden"
         >
           {/* Button shine effect */}
