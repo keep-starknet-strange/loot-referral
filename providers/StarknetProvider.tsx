@@ -37,6 +37,32 @@ const provider = jsonRpcProvider({
 let controllerConnectorInstance: ControllerConnector | null = null;
 let initializationPromise: Promise<ControllerConnector | null> | null = null;
 
+export function resetControllerConnector() {
+  controllerConnectorInstance = null;
+  initializationPromise = null;
+}
+
+/**
+ * Best-effort "real" disconnect from Cartridge Controller itself (clears keychain session).
+ * starknet-react's disconnect may swallow connector errors; this provides an explicit path.
+ */
+export async function disconnectControllerSession(): Promise<void> {
+  const connector = controllerConnectorInstance;
+  if (!connector) return;
+
+  // @cartridge/connector wraps @cartridge/controller provider under `connector.controller`.
+  const controller = (connector as any).controller;
+  try {
+    if (controller?.disconnect) {
+      await controller.disconnect();
+    } else if (typeof (connector as any).disconnect === 'function') {
+      await (connector as any).disconnect();
+    }
+  } catch {
+    // best-effort only
+  }
+}
+
 export function getControllerConnector(): ControllerConnector | null {
   // Only create connector in browser environment
   if (typeof window === 'undefined') {
