@@ -28,7 +28,8 @@ export function CompetitionCountdown({
 
   useEffect(() => {
     setTimeLeft(computeTimeLeft());
-    const id = window.setInterval(() => setTimeLeft(computeTimeLeft()), 30_000);
+    // Update frequently so it feels "live" even if Minutes only change once per minute.
+    const id = window.setInterval(() => setTimeLeft(computeTimeLeft()), 1_000);
     return () => window.clearInterval(id);
   }, [computeTimeLeft]);
 
@@ -36,7 +37,13 @@ export function CompetitionCountdown({
     <div className="rounded-lg border border-dungeon-border bg-dungeon-green p-4 sm:p-6">
       <div className="rounded-lg border border-dungeon-border bg-dungeon-dark/60 px-3 py-2">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div className="text-dungeon-text text-sm font-semibold">{title}</div>
+          <div className="text-dungeon-text text-sm font-semibold flex items-center gap-2">
+            <span>{title}</span>
+            <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-dungeon-text/70">
+              <span className="w-1.5 h-1.5 rounded-full bg-dungeon-green-glow animate-pulse" />
+              Live
+            </span>
+          </div>
           <div className="flex items-center gap-2 text-white tabular-nums">
             <div className="flex items-baseline gap-1 rounded-md border border-dungeon-border bg-dungeon-dark px-2 py-1 whitespace-nowrap">
               <span className="font-bold">{timeLeft.days}</span>
