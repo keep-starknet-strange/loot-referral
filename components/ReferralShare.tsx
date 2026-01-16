@@ -64,7 +64,7 @@ export function ReferralShare({ walletAddress, isConnected }: ReferralShareProps
               type="text"
               value={referralUrl}
               readOnly
-              className="flex-1 bg-dungeon-dark border border-dungeon-border rounded-lg px-3 sm:px-4 py-2 text-white text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-dungeon-green-glow"
+              className="flex-1 bg-dungeon-dark border border-dungeon-border rounded-lg px-3 sm:px-4 py-2 text-white font-mono text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-dungeon-green-glow"
             />
             <button
               onClick={handleCopy}
