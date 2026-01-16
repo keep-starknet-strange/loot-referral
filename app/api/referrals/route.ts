@@ -5,6 +5,41 @@ import { lookupAddresses } from '@cartridge/controller';
 
 const STARKNET_RPC_URL = process.env.STARKNET_RPC;
 
+// CORS: whitelist client origins that are allowed to call this API from browsers.
+const ALLOWED_ORIGINS = new Set<string>([
+  'https://death-mountain-coral.vercel.app',
+  'https://loot-referral.io',
+  'http://localhost:3000',
+]);
+
+function buildCorsHeaders(request: NextRequest): Record<string, string> {
+  const origin = request.headers.get('origin');
+  const isAllowed = origin ? ALLOWED_ORIGINS.has(origin) : false;
+
+  // If the origin isn't explicitly allowed, omit ACAO so browsers block it.
+  if (!isAllowed || !origin) {
+    return { Vary: 'Origin' };
+  }
+
+  // Echo back the allowed origin (required when using a whitelist).
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    // For preflight, browsers send the requested headers in this field; echoing it is simplest.
+    'Access-Control-Allow-Headers':
+      request.headers.get('access-control-request-headers') ?? 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+    Vary: 'Origin',
+  };
+}
+
+function withCorsHeaders(request: NextRequest, headersInit?: HeadersInit): Headers {
+  const headers = new Headers(headersInit);
+  const cors = buildCorsHeaders(request);
+  for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+  return headers;
+}
+
 if (!STARKNET_RPC_URL) {
   throw new Error(
     'Missing STARKNET_RPC environment variable. ' +
@@ -65,6 +100,13 @@ async function getLatestBlockNumber(): Promise<number> {
   return blockNumber;
 }
 
+export async function OPTIONS(request: NextRequest) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: withCorsHeaders(request),
+  });
+}
+
 /**
  * POST /api/referrals
  * Create a new referral mapping
@@ -79,9 +121,9 @@ export async function POST(request: NextRequest) {
         { error: 'Rate limit exceeded' },
         {
           status: 429,
-          headers: {
+          headers: withCorsHeaders(request, {
             'Retry-After': String(Math.ceil((rl.resetAt - Date.now()) / 1000)),
-          },
+          }),
         }
       );
     }
@@ -94,7 +136,7 @@ export async function POST(request: NextRequest) {
     if (!refereeAddressRaw || !referrerAddressRaw) {
       return NextResponse.json(
         { error: 'Missing required fields: referee_address and referrer_address' },
-        { status: 400 }
+        { status: 400, headers: withCorsHeaders(request) }
       );
     }
 
@@ -104,7 +146,7 @@ export async function POST(request: NextRequest) {
     if (!addressRegex.test(refereeAddressRaw) || !addressRegex.test(referrerAddressRaw)) {
       return NextResponse.json(
         { error: 'Invalid Starknet address format' },
-        { status: 400 }
+        { status: 400, headers: withCorsHeaders(request) }
       );
     }
 
@@ -115,7 +157,7 @@ export async function POST(request: NextRequest) {
     if (referee_address === referrer_address) {
       return NextResponse.json(
         { error: 'Cannot refer yourself' },
-        { status: 400 }
+        { status: 400, headers: withCorsHeaders(request) }
       );
     }
 
@@ -156,18 +198,18 @@ export async function POST(request: NextRequest) {
       if (error.code === '23505') {
         return NextResponse.json(
           { error: 'Referral already exists for this address' },
-          { status: 409 }
+          { status: 409, headers: withCorsHeaders(request) }
         );
       }
       throw error;
     }
 
-    return NextResponse.json({ success: true, data }, { status: 201 });
+    return NextResponse.json({ success: true, data }, { status: 201, headers: withCorsHeaders(request) });
   } catch (error: any) {
     console.error('Error creating referral:', error);
     return NextResponse.json(
       { error: error.message || 'Internal server error' },
-      { status: 500 }
+      { status: 500, headers: withCorsHeaders(request) }
     );
   }
 }
@@ -246,10 +288,10 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(
         { data: leaderboardData },
         {
-          headers: {
+          headers: withCorsHeaders(request, {
             // Let CDN cache; clients can "refresh" safely without hammering Supabase.
             'Cache-Control': 'public, s-maxage=30, stale-while-revalidate=300',
-          },
+          }),
         }
       );
     }
@@ -259,16 +301,16 @@ export async function GET(request: NextRequest) {
       { error: 'Not found' },
       {
         status: 404,
-        headers: {
+        headers: withCorsHeaders(request, {
           'Cache-Control': 'no-store',
-        },
+        }),
       }
     );
   } catch (error: any) {
     console.error('Error fetching referrals:', error);
     return NextResponse.json(
       { error: error.message || 'Internal server error' },
-      { status: 500 }
+      { status: 500, headers: withCorsHeaders(request) }
     );
   }
 }
