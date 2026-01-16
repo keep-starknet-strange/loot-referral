@@ -112,9 +112,12 @@ export function ReferralLeaderboard() {
 
   return (
     <div className="bg-dungeon-green rounded-lg border border-dungeon-border p-4 sm:p-6">
-      <div className="flex items-center gap-2 mb-4 md:mb-6">
-        <Trophy className="w-5 h-5 text-dungeon-yellow" />
-        <h2 className="text-lg sm:text-xl font-bold text-dungeon-text">Referral Leaderboard</h2>
+      <div className="mb-3 md:mb-4">
+        <div className="flex items-center gap-2">
+          <Trophy className="w-5 h-5 text-dungeon-yellow" />
+          <h2 className="text-lg sm:text-xl font-bold text-dungeon-text">Referral Leaderboard</h2>
+        </div>
+        <p className="mt-1 text-xs text-dungeon-text/80">Refreshes every 30 minutes.</p>
       </div>
 
       {leaderboard.length === 0 ? (
@@ -124,14 +127,14 @@ export function ReferralLeaderboard() {
         </div>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full table-auto min-w-[560px]">
+          <table className="w-full table-auto min-w-[520px]">
             <thead>
               <tr className="border-b border-dungeon-border">
-                <th className="text-left py-2 sm:py-3 px-2 sm:px-3 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap">Rank</th>
-                <th className="text-right py-2 sm:py-3 px-2 sm:px-3 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap">Prize Rewards (STRK)</th>
-                <th className="text-left py-2 sm:py-3 px-2 sm:px-3 text-dungeon-text font-semibold text-xs sm:text-sm">Referrer</th>
-                <th className="text-right py-2 sm:py-3 px-2 sm:px-3 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap">Players</th>
-                <th className="text-right py-2 sm:py-3 px-2 sm:px-3 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap">Points</th>
+                <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[64px]">Rank</th>
+                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[150px]">Prize (STRK)</th>
+                <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm">Referrer</th>
+                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[86px]">Players</th>
+                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[92px]">Points</th>
               </tr>
             </thead>
             <tbody>
@@ -140,8 +143,8 @@ export function ReferralLeaderboard() {
                   key={entry.referrer_address}
                   className="border-b border-dungeon-border hover:bg-dungeon-dark/50 transition-colors"
                 >
-                  <td className="py-3 sm:py-4 px-2 sm:px-3 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
+                  <td className="py-3 sm:py-4 px-1.5 sm:px-2 whitespace-nowrap">
+                    <div className="flex items-center gap-1.5">
                       {entry.rank <= 3 && (
                         <Trophy
                           className={`w-3 h-3 sm:w-4 sm:h-4 ${
@@ -156,7 +159,7 @@ export function ReferralLeaderboard() {
                       <span className="text-white font-medium text-sm sm:text-base">#{entry.rank}</span>
                     </div>
                   </td>
-                  <td className="py-3 sm:py-4 px-2 sm:px-3 text-right whitespace-nowrap tabular-nums">
+                  <td className="py-3 sm:py-4 px-1.5 sm:px-2 text-right whitespace-nowrap tabular-nums">
                     {(() => {
                       const reward = getCompetitionReward(entry.rank);
                       return reward ? (
@@ -168,21 +171,21 @@ export function ReferralLeaderboard() {
                       );
                     })()}
                   </td>
-                  <td className="py-3 sm:py-4 px-2 sm:px-3">
+                  <td className="py-3 sm:py-4 px-1.5 sm:px-2">
                     {entry.referrer_username ? (
-                      <span className="text-white font-medium text-xs sm:text-sm">
+                      <span className="text-white font-medium text-xs sm:text-sm truncate block max-w-[180px] sm:max-w-none">
                         {entry.referrer_username}
                       </span>
                     ) : (
-                      <code className="text-gray-300 font-mono text-xs sm:text-sm">
+                      <code className="text-gray-300 font-mono text-xs sm:text-sm whitespace-nowrap">
                         {truncateAddress(entry.referrer_address)}
                       </code>
                     )}
                   </td>
-                  <td className="py-3 sm:py-4 px-2 sm:px-3 text-right whitespace-nowrap tabular-nums">
+                  <td className="py-3 sm:py-4 px-1.5 sm:px-2 text-right whitespace-nowrap tabular-nums">
                     <span className="text-white font-semibold text-sm sm:text-base">{entry.total_points}</span>
                   </td>
-                  <td className="py-3 sm:py-4 px-2 sm:px-3 text-right whitespace-nowrap tabular-nums">
+                  <td className="py-3 sm:py-4 px-1.5 sm:px-2 text-right whitespace-nowrap tabular-nums">
                     <span className="text-white font-semibold text-sm sm:text-base">{entry.points?.toFixed(2) || '0.00'}</span>
                   </td>
                 </tr>
