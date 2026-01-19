@@ -142,9 +142,98 @@ async function rpcRequest<T = any>(method: string, params: any[]): Promise<T> {
   return payload?.result as T;
 }
 
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(retryAfter: string | null): number | null {
+  if (!retryAfter) return null;
+  const v = retryAfter.trim();
+  if (!v) return null;
+  // "Retry-After: <seconds>"
+  if (/^\d+$/.test(v)) return Math.max(0, parseInt(v, 10) * 1000);
+  // "Retry-After: <http-date>"
+  const dateMs = Date.parse(v);
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.max(0, dateMs - Date.now());
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function isRateLimitJsonRpcError(err: any): boolean {
+  const code = typeof err?.code === 'number' ? err.code : null;
+  const msg = typeof err?.message === 'string' ? err.message.toLowerCase() : '';
+  return code === 429 || msg.includes('compute units') || msg.includes('throughput') || msg.includes('rate');
+}
+
+function computeBackoffMs(attempt: number, baseMs: number, maxMs: number): number {
+  const exp = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
+  // full jitter (helps avoid herd retries)
+  return Math.floor(Math.random() * exp);
+}
+
+async function rpcRequestWithRetry<T = any>(
+  method: string,
+  params: any[],
+  options?: { retries?: number; baseDelayMs?: number; maxDelayMs?: number }
+): Promise<T> {
+  const retries = options?.retries ?? Number(process.env.VERIFY_RPC_RETRIES ?? 6);
+  const baseDelayMs = options?.baseDelayMs ?? Number(process.env.VERIFY_RPC_BASE_DELAY_MS ?? 250);
+  const maxDelayMs = options?.maxDelayMs ?? Number(process.env.VERIFY_RPC_MAX_DELAY_MS ?? 10_000);
+
+  let lastError: any;
+  for (let attempt = 1; attempt <= Math.max(1, retries + 1); attempt++) {
+    try {
+      const response = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+
+      if (!response.ok) {
+        if (isRetryableHttpStatus(response.status) && attempt <= retries) {
+          const ra = parseRetryAfterMs(response.headers.get('retry-after'));
+          const delay = ra ?? computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+          logError(`[VERIFY] RPC ${method} HTTP ${response.status}; retrying in ${delay}ms (attempt ${attempt}/${retries})`);
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`[VERIFY] RPC ${method} failed: ${response.status} ${response.statusText}`);
+      }
+
+      const payload = await response.json();
+      if (payload?.error) {
+        if (isRateLimitJsonRpcError(payload.error) && attempt <= retries) {
+          const delay = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+          logError(
+            `[VERIFY] RPC ${method} rate-limited (JSON-RPC ${payload.error?.code}); retrying in ${delay}ms (attempt ${attempt}/${retries})`
+          );
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`[VERIFY] RPC ${method} error: ${JSON.stringify(payload.error)}`);
+      }
+
+      return payload?.result as T;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt <= retries) {
+        const delay = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+        logError(`[VERIFY] RPC ${method} exception; retrying in ${delay}ms (attempt ${attempt}/${retries})`);
+        await sleep(delay);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError ?? new Error(`[VERIFY] RPC ${method} failed after retries`);
+}
+
 async function getLatestBlockNumber(): Promise<number> {
   // Fetch once per verification run
-  const result: any = await rpcRequest('starknet_blockHashAndNumber', []);
+  const result: any = await rpcRequestWithRetry('starknet_blockHashAndNumber', []);
   const blockNumber = parseBlockNumber(result?.block_number ?? result);
   if (blockNumber === null) {
     throw new Error(`[VERIFY] Unexpected blockHashAndNumber result: ${JSON.stringify(result)}`);
@@ -160,51 +249,27 @@ async function batchGetTransactions(txHashes: string[]): Promise<Map<string, Sta
   const txMap = new Map<string, StarknetTransaction>();
   if (txHashes.length === 0) return txMap;
 
-  const MAX_BATCH = 100; // conservative to avoid provider payload limits
-  for (let i = 0; i < txHashes.length; i += MAX_BATCH) {
-    const chunk = txHashes.slice(i, i + MAX_BATCH);
-    const batchPayload = chunk.map((hash, index) => ({
-      jsonrpc: '2.0',
-      id: index + 1,
-      method: 'starknet_getTransactionByHash',
-      params: [hash],
-    }));
+  // NOTE: JSON-RPC batching can create large "compute bursts" (429 CU/s) on providers like Alchemy.
+  // Instead, do per-tx requests with bounded concurrency + retry/backoff.
+  const TX_CONCURRENCY = Number(process.env.VERIFY_TX_CONCURRENCY ?? 3);
+  const limit = createConcurrencyLimiter(Math.max(1, TX_CONCURRENCY));
 
-    logSensitive(`[VERIFY] Batch fetching ${chunk.length} transactions...`);
-
-    try {
-      const response = await fetch(RPC_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(batchPayload),
-      });
-
-      if (!response.ok) {
-        logError(`[VERIFY] Batch request failed: ${response.status} ${response.statusText}`);
-        continue;
-      }
-
-      const results = await response.json();
-      const responses = Array.isArray(results) ? results : [results];
-
-      responses.forEach((result: any, idx: number) => {
-        const hash = chunk[idx];
-        if (!hash) return;
-        if (result?.error) {
-          logError(`[VERIFY] Error in batch response for tx ${hash}:`, result.error);
-          return;
+  await Promise.all(
+    txHashes.map(hash =>
+      limit(async () => {
+        try {
+          const tx = await rpcRequestWithRetry<StarknetTransaction>('starknet_getTransactionByHash', [hash]);
+          if (tx) txMap.set(hash, tx);
+        } catch (e) {
+          logError(`[VERIFY] Failed to fetch tx ${hash}:`, e);
         }
-        if (result?.result) {
-          txMap.set(hash, result.result as StarknetTransaction);
-        }
-      });
-    } catch (error) {
-      logError(`[VERIFY] Error in batch transaction fetch:`, error);
-      continue;
-    }
-  }
+      })
+    )
+  );
 
-  logSensitive(`[VERIFY] Successfully fetched ${txMap.size} of ${txHashes.length} transactions`);
+  logSensitive(
+    `[VERIFY] Successfully fetched ${txMap.size} of ${txHashes.length} transactions (concurrency=${TX_CONCURRENCY})`
+  );
   return txMap;
 }
 
@@ -244,7 +309,7 @@ async function fetchEventsForAddress(
     };
     if (continuationToken) filter.continuation_token = continuationToken;
 
-    const result: any = await rpcRequest('starknet_getEvents', [filter]);
+    const result: any = await rpcRequestWithRetry('starknet_getEvents', [filter]);
     const batch: StarknetEvent[] = Array.isArray(result?.events) ? result.events : [];
     events.push(...batch);
 
@@ -511,7 +576,7 @@ export async function POST(request: NextRequest) {
 
       // Chunk addresses into groups of 50 (as requested) and fetch per-address with concurrency
       const ADDRESS_CHUNK = 50;
-      const EVENT_CONCURRENCY = 10;
+      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 5);
       const limitEvents = createConcurrencyLimiter(EVENT_CONCURRENCY);
 
       const activityPairs: Array<{ referee: string; blockNumber: number; txHash: string }> = [];
