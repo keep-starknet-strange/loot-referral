@@ -169,9 +169,77 @@ function isRateLimitJsonRpcError(err: any): boolean {
 }
 
 function computeBackoffMs(attempt: number, baseMs: number, maxMs: number): number {
+  // Exponential backoff with jitter, but avoid ultra-short sleeps that hammer providers.
+  // attempt=1 => ~[base/2 .. base], attempt=2 => ~[base .. 2*base], etc.
   const exp = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
-  // full jitter (helps avoid herd retries)
-  return Math.floor(Math.random() * exp);
+  const min = Math.floor(exp / 2);
+  const range = Math.max(1, exp - min);
+  return min + Math.floor(Math.random() * range);
+}
+
+function getRpcPacingState() {
+  const g = globalThis as any;
+  if (!g.__verifyRpcPacing) {
+    g.__verifyRpcPacing = {
+      // Defaults chosen to be safe on Alchemy free tier without any env tuning.
+      // This is a GLOBAL cap across all verifier RPC calls in a single runtime.
+      minIntervalMs: 150, // ~6-7 req/sec
+      nextAt: 0,
+      queue: Promise.resolve(),
+      // Adaptive backoff on 429 bursts
+      last429At: 0,
+      consecutive429: 0,
+    };
+  }
+  return g.__verifyRpcPacing as {
+    minIntervalMs: number;
+    nextAt: number;
+    queue: Promise<void>;
+    last429At: number;
+    consecutive429: number;
+  };
+}
+
+function noteRateLimitHit() {
+  const s = getRpcPacingState();
+  const now = Date.now();
+  s.last429At = now;
+  s.consecutive429 += 1;
+
+  // Multiplicative increase, bounded. This quickly damps bursts.
+  // 150 -> 300 -> 600 -> 1200 -> 2000ms
+  const bumped = Math.min(2000, Math.max(250, Math.floor(s.minIntervalMs * 2)));
+  if (bumped !== s.minIntervalMs) {
+    s.minIntervalMs = bumped;
+  }
+}
+
+function maybeRecoverPacing() {
+  const s = getRpcPacingState();
+  const now = Date.now();
+  // If we've been stable for a while, slowly recover toward the default.
+  if (s.last429At && now - s.last429At > 60_000) {
+    s.consecutive429 = 0;
+    s.minIntervalMs = Math.max(150, Math.floor(s.minIntervalMs * 0.85));
+    if (s.minIntervalMs === 150) s.last429At = 0;
+  }
+}
+
+async function rpcGlobalThrottle(): Promise<void> {
+  // Global pacing to reduce RPC bursts across concurrent tasks in a single run.
+  // Defaults are conservative (safe on Alchemy free tier) and adapt automatically on 429s.
+  maybeRecoverPacing();
+  const s = getRpcPacingState();
+  const minIntervalMs = s.minIntervalMs;
+
+  s.queue = s.queue.then(async () => {
+    const now = Date.now();
+    const nextAt = typeof s.nextAt === 'number' ? s.nextAt : 0;
+    const waitMs = Math.max(0, nextAt - now);
+    if (waitMs > 0) await sleep(waitMs);
+    s.nextAt = Date.now() + minIntervalMs;
+  });
+  await s.queue;
 }
 
 async function rpcRequestWithRetry<T = any>(
@@ -179,13 +247,15 @@ async function rpcRequestWithRetry<T = any>(
   params: any[],
   options?: { retries?: number; baseDelayMs?: number; maxDelayMs?: number }
 ): Promise<T> {
-  const retries = options?.retries ?? Number(process.env.VERIFY_RPC_RETRIES ?? 6);
-  const baseDelayMs = options?.baseDelayMs ?? Number(process.env.VERIFY_RPC_BASE_DELAY_MS ?? 250);
-  const maxDelayMs = options?.maxDelayMs ?? Number(process.env.VERIFY_RPC_MAX_DELAY_MS ?? 10_000);
+  // Conservative defaults so you don't need to tweak env vars to avoid 429s.
+  const retries = options?.retries ?? Number(process.env.VERIFY_RPC_RETRIES ?? 8);
+  const baseDelayMs = options?.baseDelayMs ?? Number(process.env.VERIFY_RPC_BASE_DELAY_MS ?? 500);
+  const maxDelayMs = options?.maxDelayMs ?? Number(process.env.VERIFY_RPC_MAX_DELAY_MS ?? 30_000);
 
   let lastError: any;
   for (let attempt = 1; attempt <= Math.max(1, retries + 1); attempt++) {
     try {
+      await rpcGlobalThrottle();
       const response = await fetch(RPC_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -194,6 +264,7 @@ async function rpcRequestWithRetry<T = any>(
 
       if (!response.ok) {
         if (isRetryableHttpStatus(response.status) && attempt <= retries) {
+          if (response.status === 429) noteRateLimitHit();
           const ra = parseRetryAfterMs(response.headers.get('retry-after'));
           const delay = ra ?? computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
           logError(`[VERIFY] RPC ${method} HTTP ${response.status}; retrying in ${delay}ms (attempt ${attempt}/${retries})`);
@@ -206,6 +277,7 @@ async function rpcRequestWithRetry<T = any>(
       const payload = await response.json();
       if (payload?.error) {
         if (isRateLimitJsonRpcError(payload.error) && attempt <= retries) {
+          noteRateLimitHit();
           const delay = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
           logError(
             `[VERIFY] RPC ${method} rate-limited (JSON-RPC ${payload.error?.code}); retrying in ${delay}ms (attempt ${attempt}/${retries})`
@@ -251,7 +323,7 @@ async function batchGetTransactions(txHashes: string[]): Promise<Map<string, Sta
 
   // NOTE: JSON-RPC batching can create large "compute bursts" (429 CU/s) on providers like Alchemy.
   // Instead, do per-tx requests with bounded concurrency + retry/backoff.
-  const TX_CONCURRENCY = Number(process.env.VERIFY_TX_CONCURRENCY ?? 3);
+  const TX_CONCURRENCY = Number(process.env.VERIFY_TX_CONCURRENCY ?? 1);
   const limit = createConcurrencyLimiter(Math.max(1, TX_CONCURRENCY));
 
   await Promise.all(
@@ -576,7 +648,7 @@ export async function POST(request: NextRequest) {
 
       // Chunk addresses into groups of 50 (as requested) and fetch per-address with concurrency
       const ADDRESS_CHUNK = 50;
-      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 5);
+      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 1);
       const limitEvents = createConcurrencyLimiter(EVENT_CONCURRENCY);
 
       const activityPairs: Array<{ referee: string; blockNumber: number; txHash: string }> = [];
