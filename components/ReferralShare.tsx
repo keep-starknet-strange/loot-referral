@@ -91,7 +91,7 @@ export function ReferralShare({ walletAddress, isConnected }: ReferralShareProps
           </p>
           <ul className="text-sm text-dungeon-text space-y-1 list-disc list-inside">
             <li>Share this link with friends</li>
-            <li>When they connect their wallet and play, you'll earn points</li>
+            <li>When they connect their wallet and play, you’ll earn points</li>
             <li>Check the leaderboard to see your ranking</li>
           </ul>
         </div>
