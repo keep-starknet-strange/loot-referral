@@ -550,6 +550,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Parse batch parameters from query string or request body
+    const url = new URL(request.url);
+    const batchLimit = Number(url.searchParams.get('batch_limit') || process.env.VERIFY_BATCH_LIMIT || 100);
+    const batchOffset = Number(url.searchParams.get('batch_offset') || 0);
+    
+    logSensitive(`[VERIFY] Batch processing: limit=${batchLimit}, offset=${batchOffset}`);
+
     // Rate limit (by IP) to reduce DDoS risk even for authorized callers.
     const ip = getClientIp(request);
     const rl = rateLimit({ key: `verify:post:${ip}`, limit: 2, windowMs: 60_000 });
@@ -583,12 +590,15 @@ export async function POST(request: NextRequest) {
       `[VERIFY] Latest block number: ${latestBlockNumber} (decimal), 0x${latestBlockNumber.toString(16)} (hex)`
     );
 
-    // Step 1: Process unverified referrals
+    // Step 1: Process unverified referrals with batching
     logSensitive(`[VERIFY] Step 1: Fetching unverified referrals from Supabase...`);
     const { data: unverifiedReferrals, error: unverifiedError } = await supabaseAdmin
       .from('referrals')
       .select('id, referee_address, created_at, has_played, last_checked_block, games_played')
-      .eq('has_played', false);
+      .eq('has_played', false)
+      .order('last_checked_block', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: true })
+      .range(batchOffset, batchOffset + batchLimit - 1);
 
     if (unverifiedError) {
       logError(`[VERIFY] Error fetching unverified referrals:`, unverifiedError);
@@ -598,12 +608,15 @@ export async function POST(request: NextRequest) {
     let unverifiedUpdated = 0;
     let newlyVerified = 0;
 
-    // Step 2: Process all verified referrals to update game counts
+    // Step 2: Process verified referrals to update game counts with batching
     logSensitive(`[VERIFY] Step 2: Fetching verified referrals to update game counts...`);
     const { data: verifiedReferrals, error: verifiedError } = await supabaseAdmin
       .from('referrals')
       .select('id, referee_address, created_at, has_played, last_checked_block, games_played')
-      .eq('has_played', true);
+      .eq('has_played', true)
+      .order('last_checked_block', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: true })
+      .range(batchOffset, batchOffset + batchLimit - 1);
 
     if (verifiedError) {
       logError(`[VERIFY] Error fetching verified referrals:`, verifiedError);
@@ -852,17 +865,25 @@ export async function POST(request: NextRequest) {
       logError('[VERIFY] Error in username update step:', error);
     }
 
+    const unverifiedCount = unverifiedReferrals?.length || 0;
+    const verifiedCount = verifiedReferrals?.length || 0;
+    // hasMore is true if either query returned a full batch (indicating more records exist)
+    const hasMore = unverifiedCount >= batchLimit || verifiedCount >= batchLimit;
+
     const result = {
       message: `Processed ${totalProcessed} referrals. Updated ${totalUpdated} game counts. ${newlyVerified} newly verified. ${usernamesUpdated} usernames updated.`,
       newlyVerified,
       updated: totalUpdated,
       usernamesUpdated,
-      unverifiedProcessed: unverifiedReferrals?.length || 0,
-      verifiedProcessed: verifiedReferrals?.length || 0,
+      unverifiedProcessed: unverifiedCount,
+      verifiedProcessed: verifiedCount,
       total: totalProcessed,
       latestBlock: latestBlockNumber,
       eventsScanned: totalEvents,
       txsFetched: totalUniqueTxs,
+      batchLimit,
+      batchOffset,
+      hasMore, // Indicates if more batches needed
     };
     
     logSensitive(`[VERIFY] ===== Verification complete =====`);
