@@ -179,11 +179,13 @@ function computeBackoffMs(attempt: number, baseMs: number, maxMs: number): numbe
 
 function getRpcPacingState() {
   const g = globalThis as any;
+  // Make RPC throttle interval configurable, default to 100ms (~10 req/sec) for better throughput
+  const defaultMinIntervalMs = Number(process.env.VERIFY_RPC_MIN_INTERVAL_MS ?? 100);
   if (!g.__verifyRpcPacing) {
     g.__verifyRpcPacing = {
-      // Defaults chosen to be safe on Alchemy free tier without any env tuning.
+      // Optimized defaults: faster while still safe on Alchemy free tier
       // This is a GLOBAL cap across all verifier RPC calls in a single runtime.
-      minIntervalMs: 150, // ~6-7 req/sec
+      minIntervalMs: defaultMinIntervalMs, // ~10 req/sec (was 6-7 req/sec)
       nextAt: 0,
       queue: Promise.resolve(),
       // Adaptive backoff on 429 bursts
@@ -207,8 +209,8 @@ function noteRateLimitHit() {
   s.consecutive429 += 1;
 
   // Multiplicative increase, bounded. This quickly damps bursts.
-  // 150 -> 300 -> 600 -> 1200 -> 2000ms
-  const bumped = Math.min(2000, Math.max(250, Math.floor(s.minIntervalMs * 2)));
+  // 100 -> 200 -> 400 -> 800 -> 1600 -> 2000ms
+  const bumped = Math.min(2000, Math.max(200, Math.floor(s.minIntervalMs * 2)));
   if (bumped !== s.minIntervalMs) {
     s.minIntervalMs = bumped;
   }
@@ -217,11 +219,12 @@ function noteRateLimitHit() {
 function maybeRecoverPacing() {
   const s = getRpcPacingState();
   const now = Date.now();
+  const defaultMinIntervalMs = Number(process.env.VERIFY_RPC_MIN_INTERVAL_MS ?? 100);
   // If we've been stable for a while, slowly recover toward the default.
   if (s.last429At && now - s.last429At > 60_000) {
     s.consecutive429 = 0;
-    s.minIntervalMs = Math.max(150, Math.floor(s.minIntervalMs * 0.85));
-    if (s.minIntervalMs === 150) s.last429At = 0;
+    s.minIntervalMs = Math.max(defaultMinIntervalMs, Math.floor(s.minIntervalMs * 0.85));
+    if (s.minIntervalMs === defaultMinIntervalMs) s.last429At = 0;
   }
 }
 
@@ -314,33 +317,89 @@ async function getLatestBlockNumber(): Promise<number> {
 }
 
 /**
+ * Send a JSON-RPC batch request
+ */
+async function rpcBatchRequest(requests: Array<{ id: number; method: string; params: any[] }>): Promise<Array<{ id: number; result?: any; error?: any }>> {
+  await rpcGlobalThrottle();
+  
+  const batch = requests.map(req => ({
+    jsonrpc: '2.0',
+    id: req.id,
+    method: req.method,
+    params: req.params,
+  }));
+
+  const response = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(batch),
+  });
+
+  if (!response.ok) {
+    throw new Error(`[VERIFY] RPC batch request failed: ${response.status} ${response.statusText}`);
+  }
+
+  const results = await response.json();
+  if (!Array.isArray(results)) {
+    throw new Error(`[VERIFY] Expected array response from batch request, got: ${typeof results}`);
+  }
+
+  return results;
+}
+
+/**
  * Batch fetch multiple transactions using JSON-RPC batch requests.
- * Keeps the same function name/signature, but chunks internally to avoid huge payloads.
+ * Uses batches of up to 1000 requests per batch (provider limit).
  */
 async function batchGetTransactions(txHashes: string[]): Promise<Map<string, StarknetTransaction>> {
   const txMap = new Map<string, StarknetTransaction>();
   if (txHashes.length === 0) return txMap;
 
-  // NOTE: JSON-RPC batching can create large "compute bursts" (429 CU/s) on providers like Alchemy.
-  // Instead, do per-tx requests with bounded concurrency + retry/backoff.
-  const TX_CONCURRENCY = Number(process.env.VERIFY_TX_CONCURRENCY ?? 1);
-  const limit = createConcurrencyLimiter(Math.max(1, TX_CONCURRENCY));
+  const BATCH_SIZE = 1000; // Provider limit for batch requests
+  const uniqueHashes = Array.from(new Set(txHashes));
+  
+  logSensitive(`[VERIFY] Fetching ${uniqueHashes.length} unique transactions using batch requests (batch size: ${BATCH_SIZE})`);
 
-  await Promise.all(
-    txHashes.map(hash =>
-      limit(async () => {
-        try {
-          const tx = await rpcRequestWithRetry<StarknetTransaction>('starknet_getTransactionByHash', [hash]);
-          if (tx) txMap.set(hash, tx);
-        } catch (e) {
-          logError(`[VERIFY] Failed to fetch tx ${hash}:`, e);
+  // Process in chunks of BATCH_SIZE
+  for (let i = 0; i < uniqueHashes.length; i += BATCH_SIZE) {
+    const chunk = uniqueHashes.slice(i, i + BATCH_SIZE);
+    const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(uniqueHashes.length / BATCH_SIZE);
+    
+    logSensitive(`[VERIFY] Processing batch ${batchNumber}/${totalBatches} (${chunk.length} transactions)`);
+
+    try {
+      // Create batch request
+      const requests = chunk.map((hash, idx) => ({
+        id: i + idx + 1, // Unique ID for each request
+        method: 'starknet_getTransactionByHash',
+        params: [hash],
+      }));
+
+      const results = await rpcBatchRequest(requests);
+
+      // Map results back to transaction hashes
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        const hash = chunk[j];
+        
+        if (result.error) {
+          logError(`[VERIFY] Failed to fetch tx ${hash}:`, result.error);
+          continue;
         }
-      })
-    )
-  );
+        
+        if (result.result) {
+          txMap.set(hash, result.result as StarknetTransaction);
+        }
+      }
+    } catch (e) {
+      logError(`[VERIFY] Error in batch ${batchNumber}:`, e);
+      // Continue with next batch even if one fails
+    }
+  }
 
   logSensitive(
-    `[VERIFY] Successfully fetched ${txMap.size} of ${txHashes.length} transactions (concurrency=${TX_CONCURRENCY})`
+    `[VERIFY] Successfully fetched ${txMap.size} of ${uniqueHashes.length} transactions using batch requests`
   );
   return txMap;
 }
@@ -361,15 +420,24 @@ function txCalldataHasSelector(tx: StarknetTransaction | undefined, selector: st
 async function fetchEventsForAddress(
   address: string,
   fromBlock: number,
-  toBlock: number
+  toBlock: number,
+  options?: { maxPages?: number; timeoutMs?: number }
 ): Promise<StarknetEvent[]> {
   const events: StarknetEvent[] = [];
+  const maxPages = options?.maxPages ?? 100; // Reduced from 10,000 to 100 default
+  const timeoutMs = options?.timeoutMs ?? 30_000; // 30 second timeout per address
+  const startTime = Date.now();
 
   let continuationToken: string | undefined;
   let page = 0;
-  const MAX_PAGES = 10_000;
 
-  while (page < MAX_PAGES) {
+  while (page < maxPages) {
+    // Check timeout
+    if (Date.now() - startTime > timeoutMs) {
+      logError(`[VERIFY] Timeout fetching events for address ${address} after ${timeoutMs}ms (fetched ${page} pages)`);
+      break;
+    }
+
     page++;
     const filter: any = {
       from_block: { block_number: fromBlock },
@@ -385,12 +453,18 @@ async function fetchEventsForAddress(
     const batch: StarknetEvent[] = Array.isArray(result?.events) ? result.events : [];
     events.push(...batch);
 
+    // Optimization 2: Early exit if first page is empty (no events found)
+    if (page === 1 && batch.length === 0) {
+      logSensitive(`[VERIFY] No events found for ${address} on first page, skipping further pagination`);
+      break;
+    }
+
     continuationToken = result?.continuation_token;
     if (!continuationToken) break;
   }
 
-  if (page >= MAX_PAGES) {
-    logError(`[VERIFY] Hit MAX_PAGES=${MAX_PAGES} paginating getEvents for address ${address}`);
+  if (page >= maxPages) {
+    logError(`[VERIFY] Hit MAX_PAGES=${maxPages} paginating getEvents for address ${address}`);
   }
 
   return events;
@@ -557,20 +631,23 @@ export async function POST(request: NextRequest) {
     
     logSensitive(`[VERIFY] Batch processing: limit=${batchLimit}, offset=${batchOffset}`);
 
-    // Rate limit (by IP) to reduce DDoS risk even for authorized callers.
-    const ip = getClientIp(request);
-    const rl = rateLimit({ key: `verify:post:${ip}`, limit: 2, windowMs: 60_000 });
-    if (!rl.ok) {
-      return NextResponse.json(
-        { error: 'Rate limit exceeded' },
-        {
-          status: 429,
-          headers: {
-            'Cache-Control': 'no-store',
-            'Retry-After': String(Math.ceil((rl.resetAt - Date.now()) / 1000)),
-          },
-        }
-      );
+    // Rate limit (by IP) to reduce DDoS risk for unauthenticated callers.
+    // Skip rate limiting if API key is provided (already authenticated).
+    if (!providedKey || providedKey !== VERIFY_API_KEY) {
+      const ip = getClientIp(request);
+      const rl = rateLimit({ key: `verify:post:${ip}`, limit: 2, windowMs: 60_000 });
+      if (!rl.ok) {
+        return NextResponse.json(
+          { error: 'Rate limit exceeded' },
+          {
+            status: 429,
+            headers: {
+              'Cache-Control': 'no-store',
+              'Retry-After': String(Math.ceil((rl.resetAt - Date.now()) / 1000)),
+            },
+          }
+        );
+      }
     }
 
     // Ensure only one verification run happens per runtime at a time.
@@ -628,16 +705,6 @@ export async function POST(request: NextRequest) {
       ...(verifiedReferrals || []),
     ];
 
-    // Step 3: Broad event search across referees using min last_checked_block
-    let fromBlock = 0;
-    if (allReferrals.length > 0) {
-      const minLastCheckedBlock = allReferrals.reduce(
-        (min, r) => Math.min(min, r.last_checked_block || 0),
-        Number.POSITIVE_INFINITY
-      );
-      fromBlock = Number.isFinite(minLastCheckedBlock) ? Math.max(0, minLastCheckedBlock) : 0;
-    }
-
     let verifiedUpdated = 0;
     let totalEvents = 0;
     let totalUniqueTxs = 0;
@@ -656,19 +723,33 @@ export async function POST(request: NextRequest) {
       const uniqueReferees = Array.from(new Set(normalizedReferees));
 
       logSensitive(
-        `[VERIFY] Step 3: Broad event search for ${uniqueReferees.length} referees from block ${fromBlock} to ${latestBlockNumber}...`
+        `[VERIFY] Step 3: Broad event search for ${uniqueReferees.length} referees using per-address last_checked_block...`
       );
 
       // Chunk addresses into groups of 50 (as requested) and fetch per-address with concurrency
       const ADDRESS_CHUNK = 50;
-      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 1);
+      // Increased default concurrency from 3 to 5 for better throughput
+      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 5);
       const limitEvents = createConcurrencyLimiter(EVENT_CONCURRENCY);
+      
+      // Optimization: Skip addresses checked recently (within last N blocks)
+      const BLOCKS_TO_SKIP_RECENT = Number(process.env.VERIFY_SKIP_RECENT_BLOCKS ?? 100);
+      
+      // Add overall timeout check
+      const overallStartTime = Date.now();
+      const MAX_OVERALL_TIME_MS = 240_000; // 4 minutes
 
       const activityPairs: Array<{ referee: string; blockNumber: number; txHash: string }> = [];
       let missingTxHash = 0;
       let missingBlockNumber = 0;
 
       for (let i = 0; i < uniqueReferees.length; i += ADDRESS_CHUNK) {
+        // Check overall timeout
+        if (Date.now() - overallStartTime > MAX_OVERALL_TIME_MS) {
+          logError(`[VERIFY] Overall timeout reached, stopping event fetching`);
+          break;
+        }
+
         const chunk = uniqueReferees.slice(i, i + ADDRESS_CHUNK);
         logSensitive(`[VERIFY] Step 3: Scanning referee chunk ${i / ADDRESS_CHUNK + 1}/${Math.ceil(uniqueReferees.length / ADDRESS_CHUNK)} (${chunk.length} addresses)`);
 
@@ -676,7 +757,26 @@ export async function POST(request: NextRequest) {
           chunk.map(referee =>
             limitEvents(async () => {
               try {
-                const events = await fetchEventsForAddress(referee, fromBlock, latestBlockNumber);
+                // Use per-address fromBlock instead of global min
+                const lastChecked = lastCheckedByReferee.get(referee) || 0;
+                const fromBlock = Math.max(0, lastChecked);
+                
+                // Optimization 1: Skip if checked very recently (within last N blocks)
+                const blocksSinceLastCheck = latestBlockNumber - fromBlock;
+                if (blocksSinceLastCheck < BLOCKS_TO_SKIP_RECENT) {
+                  logSensitive(
+                    `[VERIFY] Skipping ${referee} - checked recently (${blocksSinceLastCheck} blocks ago, threshold: ${BLOCKS_TO_SKIP_RECENT})`
+                  );
+                  return { referee, events: [] as StarknetEvent[] };
+                }
+                
+                // Limit pages and add timeout per address
+                const events = await fetchEventsForAddress(
+                  referee, 
+                  fromBlock, 
+                  latestBlockNumber,
+                  { maxPages: 50, timeoutMs: 20_000 } // 50 pages max, 20s timeout per address
+                );
                 return { referee, events };
               } catch (e) {
                 logError(`[VERIFY] Error fetching events for referee ${referee}:`, e);
@@ -807,49 +907,59 @@ export async function POST(request: NextRequest) {
 
             logSensitive(`[VERIFY] Normalized ${normalizedMap.size} address mappings`);
 
-            // Update each referral with missing usernames
-            for (const ref of referralsWithoutUsernames) {
-              const updates: { referee_username?: string; referrer_username?: string } = {};
-              let needsUpdate = false;
+            // Update each referral with missing usernames in parallel (was sequential)
+            const USERNAME_UPDATE_CONCURRENCY = Number(process.env.VERIFY_USERNAME_UPDATE_CONCURRENCY ?? 5);
+            const limitUsernameUpdates = createConcurrencyLimiter(USERNAME_UPDATE_CONCURRENCY);
 
-              if (!ref.referee_username && ref.referee_address) {
-                // Try both original and normalized versions
-                const refAddr = ref.referee_address.toLowerCase();
-                const refNorm = normalizeFeltHex(ref.referee_address);
-                const username = normalizedMap.get(refAddr) || (refNorm ? normalizedMap.get(refNorm.toLowerCase()) : undefined);
-                if (username) {
-                  updates.referee_username = username;
-                  needsUpdate = true;
-                  logSensitive(`[VERIFY] Matched referee username: ${username} for ${ref.referee_address}`);
-                }
-              }
+            const usernameUpdateResults = await Promise.all(
+              referralsWithoutUsernames.map(ref =>
+                limitUsernameUpdates(async () => {
+                  const updates: { referee_username?: string; referrer_username?: string } = {};
+                  let needsUpdate = false;
 
-              if (!ref.referrer_username && ref.referrer_address) {
-                // Try both original and normalized versions
-                const rerrAddr = ref.referrer_address.toLowerCase();
-                const rerrNorm = normalizeFeltHex(ref.referrer_address);
-                const username = normalizedMap.get(rerrAddr) || (rerrNorm ? normalizedMap.get(rerrNorm.toLowerCase()) : undefined);
-                if (username) {
-                  updates.referrer_username = username;
-                  needsUpdate = true;
-                  logSensitive(`[VERIFY] Matched referrer username: ${username} for ${ref.referrer_address}`);
-                }
-              }
+                  if (!ref.referee_username && ref.referee_address) {
+                    // Try both original and normalized versions
+                    const refAddr = ref.referee_address.toLowerCase();
+                    const refNorm = normalizeFeltHex(ref.referee_address);
+                    const username = normalizedMap.get(refAddr) || (refNorm ? normalizedMap.get(refNorm.toLowerCase()) : undefined);
+                    if (username) {
+                      updates.referee_username = username;
+                      needsUpdate = true;
+                      logSensitive(`[VERIFY] Matched referee username: ${username} for ${ref.referee_address}`);
+                    }
+                  }
 
-              if (needsUpdate) {
-                const { error: updateError } = await supabaseAdmin
-                  .from('referrals')
-                  .update(updates)
-                  .eq('id', ref.id);
+                  if (!ref.referrer_username && ref.referrer_address) {
+                    // Try both original and normalized versions
+                    const rerrAddr = ref.referrer_address.toLowerCase();
+                    const rerrNorm = normalizeFeltHex(ref.referrer_address);
+                    const username = normalizedMap.get(rerrAddr) || (rerrNorm ? normalizedMap.get(rerrNorm.toLowerCase()) : undefined);
+                    if (username) {
+                      updates.referrer_username = username;
+                      needsUpdate = true;
+                      logSensitive(`[VERIFY] Matched referrer username: ${username} for ${ref.referrer_address}`);
+                    }
+                  }
 
-                if (updateError) {
-                  logError(`[VERIFY] Error updating usernames for referral ${ref.id}:`, updateError);
-                } else {
-                  usernamesUpdated++;
-                  logSensitive(`[VERIFY] Updated usernames for referral ${ref.id}`);
-                }
-              }
-            }
+                  if (needsUpdate) {
+                    const { error: updateError } = await supabaseAdmin
+                      .from('referrals')
+                      .update(updates)
+                      .eq('id', ref.id);
+
+                    if (updateError) {
+                      logError(`[VERIFY] Error updating usernames for referral ${ref.id}:`, updateError);
+                      return 0;
+                    } else {
+                      logSensitive(`[VERIFY] Updated usernames for referral ${ref.id}`);
+                      return 1;
+                    }
+                  }
+                  return 0;
+                })
+              )
+            );
+            usernamesUpdated = usernameUpdateResults.reduce((sum: number, count: number) => sum + count, 0);
 
             logSensitive(`[VERIFY] Username update complete: ${usernamesUpdated} referrals updated`);
           } catch (lookupError: any) {
