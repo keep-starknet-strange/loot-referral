@@ -46,11 +46,18 @@ STARKNET_RPC=your_starknet_rpc_url
 ADMIN_ADDRESS=your_admin_starknet_account_address
 ADMIN_PRIVATE_KEY=your_admin_private_key
 INVITE_CODES=code1,code2,code3
-# Optional: path for claim state JSON (default: ./data/claim-state.json). Use /tmp/claim-state.json on serverless if needed.
-# CLAIM_STATE_PATH=/tmp/claim-state.json
+# Invite claim state (required for ticket claimer): Supabase table ticket_claims
+NEXT_PUBLIC_SUPABASE_URL_INVITE=https://xxxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY_INVITE=your_service_role_key
 ```
 
-### 3 . Create Supabase database
+### 3. Create Supabase database
+
+For the **Invite Ticket Claimer**, claim state is stored only in Supabase (no JSON file). Create the table in your invite Supabase project:
+
+- Open the project (e.g. the one used for `NEXT_PUBLIC_SUPABASE_URL_INVITE`) → **SQL Editor** → New query → paste and run the contents of `supabase/ticket_claims.sql`.
+
+Set `NEXT_PUBLIC_SUPABASE_URL_INVITE` and `SUPABASE_SERVICE_ROLE_KEY_INVITE` so the claim flow can persist and enforce one claim per address and per-code limits.
 
 ### 4. Run Development Server
 
@@ -196,7 +203,7 @@ The app includes an **Invite Code Ticket Claimer** that lets users enter a text 
 - **One claim per address:** Each Starknet address can only claim once.
 - **Constants:** Ticket contract `0x0452810188C4Cb3AEbD63711a3b445755BC0D6C4f27B923fDd99B1A118858136`.
 
-Required env vars: `STARKNET_RPC`, `ADMIN_ADDRESS`, `ADMIN_PRIVATE_KEY`. **Important:** (1) `ADMIN_ADDRESS` must be a **deployed** Starknet account on the same network as `STARKNET_RPC`. (2) The admin account must **hold Dungeon Ticket tokens** at the ticket contract address — each claim transfers 1 ticket from the admin to the user, so "ERC20: INSUFFICIENT BALANCE" means the admin wallet needs to be funded with tickets. Optional `CLAIM_STATE_PATH` for persistent claim state (default `./data/claim-state.json`; on serverless you may set it to `/tmp/claim-state.json`).
+Required env vars: `STARKNET_RPC`, `ADMIN_ADDRESS`, `ADMIN_PRIVATE_KEY`. **Important:** (1) `ADMIN_ADDRESS` must be a **deployed** Starknet account on the same network as `STARKNET_RPC`. (2) The admin account must **hold Dungeon Ticket tokens** at the ticket contract address — each claim transfers 1 ticket from the admin to the user, so "ERC20: INSUFFICIENT BALANCE" means the admin wallet needs to be funded with tickets. Claim state is stored only in Supabase: set `NEXT_PUBLIC_SUPABASE_URL_INVITE` and `SUPABASE_SERVICE_ROLE_KEY_INVITE` and run `supabase/ticket_claims.sql` in that project.
 
 ## Project Structure
 
@@ -220,7 +227,7 @@ Required env vars: `STARKNET_RPC`, `ADMIN_ADDRESS`, `ADMIN_PRIVATE_KEY`. **Impor
 ├── hooks/
 │   └── useReferral.ts            # Referral capture hook
 ├── lib/
-│   ├── claim-state.ts            # Claim state (uses, claimed addresses)
+│   ├── claim-state.ts            # Claim state (Supabase ticket_claims only)
 │   ├── invite-codes.example.json # Example format only; real codes via INVITE_CODES env
 │   ├── referral.ts               # Referral utilities
 │   └── supabase.ts               # Supabase client

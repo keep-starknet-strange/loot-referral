@@ -1,7 +1,10 @@
-import fs from 'fs';
-import path from 'path';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 const MAX_USES_PER_CODE = 25;
+const TABLE = 'ticket_claims';
+
+const NOT_CONFIGURED =
+  'Invite claim state not configured. Set NEXT_PUBLIC_SUPABASE_URL_INVITE and SUPABASE_SERVICE_ROLE_KEY_INVITE.';
 
 export type ClaimState = {
   byCode: Record<string, number>;
@@ -19,60 +22,70 @@ function normalizeAddress(addr: string): string {
   return s;
 }
 
-function getStatePath(): string | null {
-  const envPath = process.env.CLAIM_STATE_PATH;
-  if (envPath) return envPath;
-  try {
-    const dataDir = path.join(process.cwd(), 'data');
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    return path.join(dataDir, 'claim-state.json');
-  } catch {
-    return null;
-  }
+function getSupabase(): SupabaseClient | null {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL_INVITE;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY_INVITE;
+  if (!url || !key) return null;
+  return createClient(url, key, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
 }
 
-function loadState(): ClaimState {
-  const statePath = getStatePath();
-  if (!statePath || !fs.existsSync(statePath)) return { ...defaultState };
-  try {
-    const raw = fs.readFileSync(statePath, 'utf-8');
-    const data = JSON.parse(raw) as ClaimState;
-    return {
-      byCode: typeof data.byCode === 'object' && data.byCode !== null ? data.byCode : {},
-      claimedAddresses: Array.isArray(data.claimedAddresses) ? data.claimedAddresses : [],
-    };
-  } catch {
+type TicketClaimRow = { address: string; code: string };
+
+async function loadStateSupabase(): Promise<ClaimState> {
+  const db = getSupabase();
+  if (!db) return { ...defaultState };
+
+  const { data: rows, error } = await db.from(TABLE).select('address, code');
+  if (error) {
+    console.error('[claim-state] Supabase load error:', error);
     return { ...defaultState };
   }
+
+  const list = (rows ?? []) as TicketClaimRow[];
+  const claimedAddresses = list.map((r) => r.address.toLowerCase());
+  const byCode: Record<string, number> = {};
+  for (const r of list) {
+    const c = r.code.trim();
+    byCode[c] = (byCode[c] ?? 0) + 1;
+  }
+  return { byCode, claimedAddresses };
 }
 
-function saveState(state: ClaimState): void {
-  const statePath = getStatePath();
-  if (!statePath) return;
-  try {
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[claim-state] Failed to save state:', err);
+export async function getClaimState(): Promise<ClaimState> {
+  if (!getSupabase()) return { ...defaultState };
+  return loadStateSupabase();
+}
+
+export async function recordClaim(code: string, address: string): Promise<void> {
+  const db = getSupabase();
+  if (!db) throw new Error(NOT_CONFIGURED);
+
+  const normalized = normalizeAddress(address);
+  const { error } = await db.from(TABLE).insert({
+    address: normalized,
+    code: code.trim(),
+  });
+  if (error) {
+    console.error('[claim-state] Supabase insert error:', error);
+    throw new Error('Failed to record claim');
   }
 }
 
-export function getClaimState(): ClaimState {
-  return loadState();
-}
-
-export function recordClaim(code: string, address: string): void {
-  const state = loadState();
-  const normalized = normalizeAddress(address);
-  state.claimedAddresses.push(normalized);
-  state.byCode[code] = (state.byCode[code] ?? 0) + 1;
-  saveState(state);
-}
-
-export function canClaim(code: string, address: string, validCodes: string[]): { ok: boolean; error?: string } {
+export async function canClaim(
+  code: string,
+  address: string,
+  validCodes: string[]
+): Promise<{ ok: boolean; error?: string }> {
   if (!validCodes.includes(code)) {
     return { ok: false, error: 'Invalid invite code' };
   }
-  const state = loadState();
+  const db = getSupabase();
+  if (!db) {
+    return { ok: false, error: NOT_CONFIGURED };
+  }
+  const state = await loadStateSupabase();
   const normalized = normalizeAddress(address);
   if (state.claimedAddresses.includes(normalized)) {
     return { ok: false, error: 'This address has already claimed a ticket' };
