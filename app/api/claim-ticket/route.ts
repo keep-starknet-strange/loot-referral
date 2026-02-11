@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import path from 'path';
 import fs from 'fs';
 import { Account, RpcProvider, cairo } from 'starknet';
-import { getClaimState, canClaim, recordClaim } from '@/lib/claim-state';
+import { canClaim, recordClaim } from '@/lib/claim-state';
 import { getClientIp, rateLimit } from '@/lib/rateLimit';
 
 const TICKET_CONTRACT = '0x0452810188C4Cb3AEbD63711a3b445755BC0D6C4f27B923fDd99B1A118858136';
@@ -89,7 +89,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const check = canClaim(inviteCode, userAddress, validCodes);
+    const check = await canClaim(inviteCode, userAddress, validCodes);
     if (!check.ok) {
       return NextResponse.json({ error: check.error }, { status: 400 });
     }
@@ -132,7 +132,7 @@ export async function POST(request: NextRequest) {
         throw new Error('No transaction hash returned');
       }
 
-      recordClaim(inviteCode, userAddress);
+      await recordClaim(inviteCode, userAddress);
 
       return NextResponse.json({
         success: true,
