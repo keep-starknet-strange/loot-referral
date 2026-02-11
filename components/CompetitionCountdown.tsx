@@ -11,8 +11,8 @@ interface CompetitionCountdownProps {
 
 export function CompetitionCountdown({
   title = '75k STRK Competition ends in:',
-  // Feb 16, 2026 23:59 UTC
-  endsAtUtcMs = Date.UTC(2026, 1, 16, 23, 59, 0),
+  // 27 Feb 2026 00:00 UTC
+  endsAtUtcMs = Date.UTC(2026, 1, 27, 0, 0, 0),
 }: CompetitionCountdownProps) {
   const computeTimeLeft = useMemo(() => {
     return (): TimeLeft => {
