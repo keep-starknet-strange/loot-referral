@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Trophy, Users } from 'lucide-react';
+import { Trophy, Users, ChevronDown, ChevronUp } from 'lucide-react';
+
+const TOP_N_VISIBLE = 10;
 
 interface LeaderboardEntry {
   rank: number;
@@ -15,6 +17,7 @@ export function ReferralLeaderboard() {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
 
   const getCompetitionReward = (rank: number): number | null => {
     switch (rank) {
@@ -126,19 +129,20 @@ export function ReferralLeaderboard() {
           <p>No referrals yet. Be the first to refer players!</p>
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full table-auto min-w-[520px]">
-            <thead>
-              <tr className="border-b border-dungeon-border">
-                <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[64px]">Rank</th>
-                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[150px]">Prize (STRK)</th>
-                <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm">Referrer</th>
-                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[86px]">Players</th>
-                <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[92px]">Points</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leaderboard.map((entry) => (
+        <>
+          <div className="overflow-x-auto">
+            <table className="w-full table-auto min-w-[520px]">
+              <thead>
+                <tr className="border-b border-dungeon-border">
+                  <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[64px]">Rank</th>
+                  <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[150px]">Prize (STRK)</th>
+                  <th className="text-left py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm">Referrer</th>
+                  <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[86px]">Players</th>
+                  <th className="text-right py-2 sm:py-3 px-1.5 sm:px-2 text-dungeon-text font-semibold text-xs sm:text-sm whitespace-nowrap w-[92px]">Points</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(expanded ? leaderboard : leaderboard.slice(0, TOP_N_VISIBLE)).map((entry) => (
                 <tr
                   key={entry.referrer_address}
                   className="border-b border-dungeon-border hover:bg-dungeon-dark/50 transition-colors"
@@ -190,9 +194,29 @@ export function ReferralLeaderboard() {
                   </td>
                 </tr>
               ))}
-            </tbody>
-          </table>
-        </div>
+              </tbody>
+            </table>
+          </div>
+          {leaderboard.length > TOP_N_VISIBLE && (
+            <button
+              type="button"
+              onClick={() => setExpanded((e) => !e)}
+              className="mt-3 w-full py-2 rounded-lg border border-dungeon-border bg-dungeon-dark/60 hover:bg-dungeon-dark text-dungeon-text text-sm font-medium flex items-center justify-center gap-2 transition-colors"
+            >
+              {expanded ? (
+                <>
+                  <ChevronUp className="w-4 h-4" />
+                  Show top 10 only
+                </>
+              ) : (
+                <>
+                  <ChevronDown className="w-4 h-4" />
+                  Show all ({leaderboard.length})
+                </>
+              )}
+            </button>
+          )}
+        </>
       )}
     </div>
   );

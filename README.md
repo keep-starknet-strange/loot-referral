@@ -26,6 +26,8 @@ A referral tracking system for Loot Survivor on Starknet. Track which players br
 npm install
 ```
 
+The repo uses **starknet@9** and **@cartridge/connector** / **@cartridge/controller** latest. Because `@starknet-react/core@5` declares a peer dependency on `starknet@^8`, `.npmrc` sets `legacy-peer-deps=true` so `npm install` succeeds. You can update all of these with `npm update` (or bump versions in `package.json` and run `npm install` again).
+
 ### 2. Environment Variables
 
 Create a `.env.local` file in the root directory:
@@ -37,17 +39,38 @@ SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 VERIFY_API_KEY=your_verify_endpoint_secret
 NEXT_PUBLIC_LOOT_SURVIVOR_CONTRACT=0x0100000000000000000000000000000000000000000000000000000000000000
 NEXT_PUBLIC_STARKNET_CHAIN=mainnet
+NEXT_PUBLIC_STARKNET_RPC=your_starknet_rpc_url
+
+# Invite Code Ticket Claimer (server-only; never expose admin key or real codes)
+STARKNET_RPC=your_starknet_rpc_url
+ADMIN_ADDRESS=your_admin_starknet_account_address
+ADMIN_PRIVATE_KEY=your_admin_private_key
+INVITE_CODES=code1,code2,code3
+# Invite claim state (required for ticket claimer): Supabase table ticket_claims
+NEXT_PUBLIC_SUPABASE_URL_INVITE=https://xxxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY_INVITE=your_service_role_key
 ```
 
-### 3 . Create Supabase database
+### 3. Create Supabase database
+
+For the **Invite Ticket Claimer**, claim state is stored only in Supabase (no JSON file). Create the table in your invite Supabase project:
+
+- Open the project (e.g. the one used for `NEXT_PUBLIC_SUPABASE_URL_INVITE`) → **SQL Editor** → New query → paste and run the contents of `supabase/ticket_claims.sql`.
+
+Set `NEXT_PUBLIC_SUPABASE_URL_INVITE` and `SUPABASE_SERVICE_ROLE_KEY_INVITE` so the claim flow can persist and enforce one claim per address and per-code limits.
 
 ### 4. Run Development Server
 
-```bash
-npm run dev
-```
+**HTTPS (recommended for dev, e.g. wallet connections):**
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+1. Install [mkcert](https://github.com/FiloSottile/mkcert) and run `mkcert -install` once.
+2. Generate certs: `npm run certs`
+3. Start the server: `npm run dev`  
+   → **https://localhost:3000**
+
+**HTTP only:** `npm run dev:http` → http://localhost:3000
+
+Open the URL in your browser.
 
 ## How It Works
 
@@ -149,11 +172,46 @@ Get verification statistics.
 }
 ```
 
+### POST `/api/claim-ticket`
+Claim 1 Dungeon Ticket using an invite code (Admin Push: gas paid by server).
+
+**Request:**
+```json
+{
+  "inviteCode": "YOUR_INVITE_CODE",
+  "address": "0x_your_starknet_address"
+}
+```
+
+**Response (success):**
+```json
+{
+  "success": true,
+  "transactionHash": "0x...",
+  "message": "1 Dungeon Ticket has been sent to your address."
+}
+```
+
+**Security:** Admin private key is server-only. Starknet address format is validated before sending the transaction. Each address can claim only once; each code is limited to 25 uses. **Invite codes must not be public:** set them in the `INVITE_CODES` environment variable (comma-separated, server-only); do not commit real codes.
+
+## Invite Code Ticket Claimer
+
+The app includes an **Invite Code Ticket Claimer** that lets users enter a text invite code and their Starknet address to receive 1 Dungeon Ticket. The transfer is executed by the Admin Wallet (gas paid server-side).
+
+- **Valid codes:** Set via **`INVITE_CODES`** env var (comma-separated, e.g. `INVITE_CODES=CODE1,CODE2,CODE3`). Never commit real codes; optional fallback file `lib/invite-codes.json` is gitignored.
+- **Max uses per code:** 25.
+- **One claim per address:** Each Starknet address can only claim once.
+- **Constants:** Ticket contract `0x0452810188C4Cb3AEbD63711a3b445755BC0D6C4f27B923fDd99B1A118858136`.
+
+Required env vars: `STARKNET_RPC`, `ADMIN_ADDRESS`, `ADMIN_PRIVATE_KEY`. **Important:** (1) `ADMIN_ADDRESS` must be a **deployed** Starknet account on the same network as `STARKNET_RPC`. (2) The admin account must **hold Dungeon Ticket tokens** at the ticket contract address — each claim transfers 1 ticket from the admin to the user, so "ERC20: INSUFFICIENT BALANCE" means the admin wallet needs to be funded with tickets. Claim state is stored only in Supabase: set `NEXT_PUBLIC_SUPABASE_URL_INVITE` and `SUPABASE_SERVICE_ROLE_KEY_INVITE` and run `supabase/ticket_claims.sql` in that project.
+
 ## Project Structure
 
 ```
 ├── app/
 │   ├── api/
+│   │   ├── claim-ticket/
+│   │   │   └── route.ts          # Invite code ticket claim (admin push)
 │   │   ├── referrals/
 │   │   │   └── route.ts          # Referral CRUD endpoints
 │   │   └── verify/
@@ -162,12 +220,15 @@ Get verification statistics.
 │   ├── layout.tsx                # Root layout
 │   └── page.tsx                  # Main page
 ├── components/
+│   ├── InviteCodeTicketClaimer.tsx # Invite code ticket claim UI
 │   ├── ReferralLeaderboard.tsx   # Leaderboard component
 │   ├── ReferralShare.tsx         # Share referral link component
 │   └── WalletConnection.tsx      # Wallet connection component
 ├── hooks/
 │   └── useReferral.ts            # Referral capture hook
 ├── lib/
+│   ├── claim-state.ts            # Claim state (Supabase ticket_claims only)
+│   ├── invite-codes.example.json # Example format only; real codes via INVITE_CODES env
 │   ├── referral.ts               # Referral utilities
 │   └── supabase.ts               # Supabase client
 ├── supabase/
@@ -186,6 +247,26 @@ The wallet connection component:
 - Automatically submits referral when wallet connects
 - Handles connect/disconnect events
 
+### Wallet won’t connect / CSP or WASM errors
+
+When you click “Connect Wallet”, the Cartridge Controller opens in an **iframe** loaded from **api.cartridge.gg**. The errors you see (Google Fonts blocked, Stripe blocked, WASM “unreachable”) come from **that iframe’s** Content-Security-Policy — i.e. from Cartridge’s server, not from this app. We can’t change their headers.
+
+**Workarounds that often fix Connect Wallet in dev:**
+
+1. **Use HTTPS**  
+   Run `npm run certs` then `npm run dev` and open **https://localhost:3000** (not `http://`).
+
+2. **Temporarily relax CSP for localhost (Chrome)**  
+   - Install an extension that disables CSP for the current site, e.g. “Disable Content-Security-Policy” or “CSP Unblock”.  
+   - Enable it only for `https://localhost:3000` (or your dev URL).  
+   - Reload and try “Connect Wallet” again.  
+   Use only for local development; leave it off on production sites.
+
+3. **Try another browser**  
+   Sometimes one browser (e.g. Chrome vs Firefox) works when the other doesn’t.
+
+4. **Report upstream**  
+   If it still fails, open an issue with [Cartridge (controller)](https://github.com/cartridge-gg/controller) and mention that their iframe CSP blocks `https://fonts.googleapis.com` and `https://js.stripe.com`, which breaks the connect flow. They need to add those to `style-src` / `script-src` (or equivalent) for their Controller UI.
 
 ## Security Considerations
 
