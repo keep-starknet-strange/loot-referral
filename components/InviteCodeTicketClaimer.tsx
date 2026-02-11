@@ -2,9 +2,10 @@
 
 import { useState } from 'react';
 import { useAccount } from '@starknet-react/core';
-import { Ticket, Loader2, CheckCircle, ExternalLink } from 'lucide-react';
+import { Ticket, Loader2, CheckCircle, ExternalLink, Swords } from 'lucide-react';
 
 const VOYAGER_TX_URL = 'https://voyager.online/tx';
+const LOOT_SURVIVOR_URL = 'https://lootsurvivor.io/survivor';
 
 export function InviteCodeTicketClaimer() {
   const { address: connectedAddress } = useAccount();
@@ -92,7 +93,7 @@ export function InviteCodeTicketClaimer() {
       </form>
 
       {success && result && 'transactionHash' in result && (
-        <div className="mt-4 p-3 rounded-lg border border-dungeon-green-light bg-dungeon-dark/50">
+        <div className="mt-4 p-3 rounded-lg border border-dungeon-green-light bg-dungeon-dark/50 space-y-3">
           <div className="flex items-start gap-2">
             <CheckCircle className="w-5 h-5 text-dungeon-green-glow flex-shrink-0 mt-0.5" />
             <div>
@@ -109,6 +110,15 @@ export function InviteCodeTicketClaimer() {
               </a>
             </div>
           </div>
+          <a
+            href={LOOT_SURVIVOR_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-full px-4 py-3 bg-dungeon-button hover:bg-dungeon-yellow-dark text-black font-bold rounded-lg transition-colors flex items-center justify-center gap-2 shadow-lg"
+          >
+            <Swords className="w-5 h-5" />
+            Enter the Dungeon
+          </a>
         </div>
       )}
 
