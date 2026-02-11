@@ -62,12 +62,28 @@ export async function recordClaim(code: string, address: string): Promise<void> 
   const db = getSupabase();
   if (!db) throw new Error(NOT_CONFIGURED);
 
+  const trimmedCode = code.trim();
   const normalized = normalizeAddress(address);
+
+  // Re-check code usage limit right before insert (prevents race over 25 uses)
+  const state = await loadStateSupabase();
+  const uses = state.byCode[trimmedCode] ?? 0;
+  if (uses >= MAX_USES_PER_CODE) {
+    throw new Error('This invite code has reached its maximum uses');
+  }
+  if (state.claimedAddresses.includes(normalized)) {
+    throw new Error('This address has already claimed a ticket');
+  }
+
   const { error } = await db.from(TABLE).insert({
     address: normalized,
-    code: code.trim(),
+    code: trimmedCode,
   });
   if (error) {
+    // Unique violation on address = double claim attempt
+    if (error.code === '23505') {
+      throw new Error('This address has already claimed a ticket');
+    }
     console.error('[claim-state] Supabase insert error:', error);
     throw new Error('Failed to record claim');
   }
