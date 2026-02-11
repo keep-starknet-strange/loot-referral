@@ -1,0 +1,1048 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabase';
+import { getClientIp, rateLimit } from '@/lib/rateLimit';
+import { lookupAddresses } from '@cartridge/controller';
+
+// Server-only environment variables (not exposed to client)
+const LOOT_SURVIVOR_CONTRACT = process.env.NEXT_PUBLIC_LOOT_SURVIVOR_CONTRACT || '0x06f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c';
+const ALCHEMY_RPC_URL = process.env.STARKNET_RPC;
+const VERIFY_API_KEY = process.env.VERIFY_API_KEY;
+
+if (!ALCHEMY_RPC_URL) {
+  throw new Error(
+    'Missing STARKNET_RPC environment variable. ' +
+    'This server-only variable is required for on-chain verification. ' +
+    'Add it to your .env.local file (without NEXT_PUBLIC_ prefix).'
+  );
+}
+
+// TypeScript assertion: ALCHEMY_RPC_URL is guaranteed to be defined after the check above
+const RPC_URL: string = ALCHEMY_RPC_URL;
+
+// Helper to gate sensitive logs in production
+const isDevelopment = process.env.NODE_ENV === 'development';
+const logSensitive = (...args: any[]) => {
+  if (isDevelopment) {
+    console.log(...args);
+  }
+};
+const logError = (...args: any[]) => {
+  // Always log errors, but sanitize sensitive data in production
+  if (isDevelopment) {
+    console.error(...args);
+  } else {
+    // In production, log errors without sensitive data
+    const sanitized = args.map(arg => {
+      if (typeof arg === 'string' && arg.includes('0x')) {
+        // Truncate addresses/hashes in production logs
+        return arg.replace(/0x[a-fA-F0-9]{60,}/g, (match) => `${match.slice(0, 10)}...`);
+      }
+      if (typeof arg === 'object' && arg !== null) {
+        // Remove sensitive fields from objects in production
+        const { referee_address, address, hash, transaction_hash, ...rest } = arg as any;
+        return rest;
+      }
+      return arg;
+    });
+    console.error(...sanitized);
+  }
+};
+
+/**
+ * Get the selector for "start_game" function
+ */
+function getStartGameSelector(): string {
+  // The selector for "start_game" method in the Loot Survivor contract
+  return '0x2214fe6a6e2545aebfe589b84884a2c528416482abec76605b7fdb1c31ce5b2';
+}
+
+/**
+ * Helpers for verification
+ */
+type ReferralRow = {
+  id: string;
+  referee_address: string;
+  referrer_address?: string;
+  referee_username?: string;
+  referrer_username?: string;
+  created_at: string;
+  has_played?: boolean;
+  last_checked_block?: number;
+  games_played?: number;
+};
+
+type StarknetEvent = {
+  from_address?: string;
+  block_number?: number | string;
+  transaction_hash?: string;
+  keys?: string[];
+  data?: string[];
+};
+
+type StarknetTransaction = {
+  type?: string;
+  sender?: string;
+  contract_address?: string;
+  entry_point_selector?: string;
+  calldata?: any[];
+  calls?: any[];
+};
+
+function parseBlockNumber(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return null;
+
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (v.startsWith('0x')) {
+    const n = parseInt(v, 16);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d+$/.test(v)) {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^[0-9a-f]+$/.test(v)) {
+    const n = parseInt(`0x${v}`, 16);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function normalizeFeltHex(value: any): string | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  const hex = v.startsWith('0x') ? v.slice(2) : v;
+  if (!hex || !/^[0-9a-f]+$/.test(hex)) return null;
+  try {
+    const bn = BigInt(`0x${hex}`);
+    return `0x${bn.toString(16)}`;
+  } catch {
+    return null;
+  }
+}
+
+async function rpcRequest<T = any>(method: string, params: any[]): Promise<T> {
+  const response = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`[VERIFY] RPC ${method} failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payload = await response.json();
+  if (payload?.error) {
+    throw new Error(`[VERIFY] RPC ${method} error: ${JSON.stringify(payload.error)}`);
+  }
+  return payload?.result as T;
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(retryAfter: string | null): number | null {
+  if (!retryAfter) return null;
+  const v = retryAfter.trim();
+  if (!v) return null;
+  // "Retry-After: <seconds>"
+  if (/^\d+$/.test(v)) return Math.max(0, parseInt(v, 10) * 1000);
+  // "Retry-After: <http-date>"
+  const dateMs = Date.parse(v);
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.max(0, dateMs - Date.now());
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function isRateLimitJsonRpcError(err: any): boolean {
+  const code = typeof err?.code === 'number' ? err.code : null;
+  const msg = typeof err?.message === 'string' ? err.message.toLowerCase() : '';
+  return code === 429 || msg.includes('compute units') || msg.includes('throughput') || msg.includes('rate');
+}
+
+function computeBackoffMs(attempt: number, baseMs: number, maxMs: number): number {
+  // Exponential backoff with jitter, but avoid ultra-short sleeps that hammer providers.
+  // attempt=1 => ~[base/2 .. base], attempt=2 => ~[base .. 2*base], etc.
+  const exp = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
+  const min = Math.floor(exp / 2);
+  const range = Math.max(1, exp - min);
+  return min + Math.floor(Math.random() * range);
+}
+
+function getRpcPacingState() {
+  const g = globalThis as any;
+  // Make RPC throttle interval configurable, default to 100ms (~10 req/sec) for better throughput
+  const defaultMinIntervalMs = Number(process.env.VERIFY_RPC_MIN_INTERVAL_MS ?? 100);
+  if (!g.__verifyRpcPacing) {
+    g.__verifyRpcPacing = {
+      // Optimized defaults: faster while still safe on Alchemy free tier
+      // This is a GLOBAL cap across all verifier RPC calls in a single runtime.
+      minIntervalMs: defaultMinIntervalMs, // ~10 req/sec (was 6-7 req/sec)
+      nextAt: 0,
+      queue: Promise.resolve(),
+      // Adaptive backoff on 429 bursts
+      last429At: 0,
+      consecutive429: 0,
+    };
+  }
+  return g.__verifyRpcPacing as {
+    minIntervalMs: number;
+    nextAt: number;
+    queue: Promise<void>;
+    last429At: number;
+    consecutive429: number;
+  };
+}
+
+function noteRateLimitHit() {
+  const s = getRpcPacingState();
+  const now = Date.now();
+  s.last429At = now;
+  s.consecutive429 += 1;
+
+  // Multiplicative increase, bounded. This quickly damps bursts.
+  // 100 -> 200 -> 400 -> 800 -> 1600 -> 2000ms
+  const bumped = Math.min(2000, Math.max(200, Math.floor(s.minIntervalMs * 2)));
+  if (bumped !== s.minIntervalMs) {
+    s.minIntervalMs = bumped;
+  }
+}
+
+function maybeRecoverPacing() {
+  const s = getRpcPacingState();
+  const now = Date.now();
+  const defaultMinIntervalMs = Number(process.env.VERIFY_RPC_MIN_INTERVAL_MS ?? 100);
+  // If we've been stable for a while, slowly recover toward the default.
+  if (s.last429At && now - s.last429At > 60_000) {
+    s.consecutive429 = 0;
+    s.minIntervalMs = Math.max(defaultMinIntervalMs, Math.floor(s.minIntervalMs * 0.85));
+    if (s.minIntervalMs === defaultMinIntervalMs) s.last429At = 0;
+  }
+}
+
+async function rpcGlobalThrottle(): Promise<void> {
+  // Global pacing to reduce RPC bursts across concurrent tasks in a single run.
+  // Defaults are conservative (safe on Alchemy free tier) and adapt automatically on 429s.
+  maybeRecoverPacing();
+  const s = getRpcPacingState();
+  const minIntervalMs = s.minIntervalMs;
+
+  s.queue = s.queue.then(async () => {
+    const now = Date.now();
+    const nextAt = typeof s.nextAt === 'number' ? s.nextAt : 0;
+    const waitMs = Math.max(0, nextAt - now);
+    if (waitMs > 0) await sleep(waitMs);
+    s.nextAt = Date.now() + minIntervalMs;
+  });
+  await s.queue;
+}
+
+async function rpcRequestWithRetry<T = any>(
+  method: string,
+  params: any[],
+  options?: { retries?: number; baseDelayMs?: number; maxDelayMs?: number }
+): Promise<T> {
+  // Conservative defaults so you don't need to tweak env vars to avoid 429s.
+  const retries = options?.retries ?? Number(process.env.VERIFY_RPC_RETRIES ?? 8);
+  const baseDelayMs = options?.baseDelayMs ?? Number(process.env.VERIFY_RPC_BASE_DELAY_MS ?? 500);
+  const maxDelayMs = options?.maxDelayMs ?? Number(process.env.VERIFY_RPC_MAX_DELAY_MS ?? 30_000);
+
+  let lastError: any;
+  for (let attempt = 1; attempt <= Math.max(1, retries + 1); attempt++) {
+    try {
+      await rpcGlobalThrottle();
+      const response = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+
+      if (!response.ok) {
+        if (isRetryableHttpStatus(response.status) && attempt <= retries) {
+          if (response.status === 429) noteRateLimitHit();
+          const ra = parseRetryAfterMs(response.headers.get('retry-after'));
+          const delay = ra ?? computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+          logError(`[VERIFY] RPC ${method} HTTP ${response.status}; retrying in ${delay}ms (attempt ${attempt}/${retries})`);
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`[VERIFY] RPC ${method} failed: ${response.status} ${response.statusText}`);
+      }
+
+      const payload = await response.json();
+      if (payload?.error) {
+        if (isRateLimitJsonRpcError(payload.error) && attempt <= retries) {
+          noteRateLimitHit();
+          const delay = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+          logError(
+            `[VERIFY] RPC ${method} rate-limited (JSON-RPC ${payload.error?.code}); retrying in ${delay}ms (attempt ${attempt}/${retries})`
+          );
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`[VERIFY] RPC ${method} error: ${JSON.stringify(payload.error)}`);
+      }
+
+      return payload?.result as T;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt <= retries) {
+        const delay = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+        logError(`[VERIFY] RPC ${method} exception; retrying in ${delay}ms (attempt ${attempt}/${retries})`);
+        await sleep(delay);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError ?? new Error(`[VERIFY] RPC ${method} failed after retries`);
+}
+
+async function getLatestBlockNumber(): Promise<number> {
+  // Fetch once per verification run
+  const result: any = await rpcRequestWithRetry('starknet_blockHashAndNumber', []);
+  const blockNumber = parseBlockNumber(result?.block_number ?? result);
+  if (blockNumber === null) {
+    throw new Error(`[VERIFY] Unexpected blockHashAndNumber result: ${JSON.stringify(result)}`);
+  }
+  return blockNumber;
+}
+
+/**
+ * Send a JSON-RPC batch request
+ */
+async function rpcBatchRequest(requests: Array<{ id: number; method: string; params: any[] }>): Promise<Array<{ id: number; result?: any; error?: any }>> {
+  await rpcGlobalThrottle();
+  
+  const batch = requests.map(req => ({
+    jsonrpc: '2.0',
+    id: req.id,
+    method: req.method,
+    params: req.params,
+  }));
+
+  const response = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(batch),
+  });
+
+  if (!response.ok) {
+    throw new Error(`[VERIFY] RPC batch request failed: ${response.status} ${response.statusText}`);
+  }
+
+  const results = await response.json();
+  if (!Array.isArray(results)) {
+    throw new Error(`[VERIFY] Expected array response from batch request, got: ${typeof results}`);
+  }
+
+  return results;
+}
+
+/**
+ * Batch fetch multiple transactions using JSON-RPC batch requests.
+ * Uses batches of up to 1000 requests per batch (provider limit).
+ */
+async function batchGetTransactions(txHashes: string[]): Promise<Map<string, StarknetTransaction>> {
+  const txMap = new Map<string, StarknetTransaction>();
+  if (txHashes.length === 0) return txMap;
+
+  const BATCH_SIZE = 1000; // Provider limit for batch requests
+  const uniqueHashes = Array.from(new Set(txHashes));
+  
+  logSensitive(`[VERIFY] Fetching ${uniqueHashes.length} unique transactions using batch requests (batch size: ${BATCH_SIZE})`);
+
+  // Process in chunks of BATCH_SIZE
+  for (let i = 0; i < uniqueHashes.length; i += BATCH_SIZE) {
+    const chunk = uniqueHashes.slice(i, i + BATCH_SIZE);
+    const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(uniqueHashes.length / BATCH_SIZE);
+    
+    logSensitive(`[VERIFY] Processing batch ${batchNumber}/${totalBatches} (${chunk.length} transactions)`);
+
+    try {
+      // Create batch request
+      const requests = chunk.map((hash, idx) => ({
+        id: i + idx + 1, // Unique ID for each request
+        method: 'starknet_getTransactionByHash',
+        params: [hash],
+      }));
+
+      const results = await rpcBatchRequest(requests);
+
+      // Map results back to transaction hashes
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        const hash = chunk[j];
+        
+        if (result.error) {
+          logError(`[VERIFY] Failed to fetch tx ${hash}:`, result.error);
+          continue;
+        }
+        
+        if (result.result) {
+          txMap.set(hash, result.result as StarknetTransaction);
+        }
+      }
+    } catch (e) {
+      logError(`[VERIFY] Error in batch ${batchNumber}:`, e);
+      // Continue with next batch even if one fails
+    }
+  }
+
+  logSensitive(
+    `[VERIFY] Successfully fetched ${txMap.size} of ${uniqueHashes.length} transactions using batch requests`
+  );
+  return txMap;
+}
+
+function txCalldataHasSelector(tx: StarknetTransaction | undefined, selector: string): boolean {
+  if (!tx || !tx.calldata || !Array.isArray(tx.calldata)) return false;
+  const normalizedSelector = selector.toLowerCase();
+  return tx.calldata.some((data: any) => {
+    if (typeof data === 'string') {
+      const v = data.toLowerCase();
+      return (v.startsWith('0x') ? v : `0x${v}`) === normalizedSelector;
+    }
+    const v = String(data).toLowerCase();
+    return (v.startsWith('0x') ? v : `0x${v}`) === normalizedSelector;
+  });
+}
+
+async function fetchEventsForAddress(
+  address: string,
+  fromBlock: number,
+  toBlock: number,
+  options?: { maxPages?: number; timeoutMs?: number }
+): Promise<StarknetEvent[]> {
+  const events: StarknetEvent[] = [];
+  const maxPages = options?.maxPages ?? 100; // Reduced from 10,000 to 100 default
+  const timeoutMs = options?.timeoutMs ?? 30_000; // 30 second timeout per address
+  const startTime = Date.now();
+
+  let continuationToken: string | undefined;
+  let page = 0;
+
+  while (page < maxPages) {
+    // Check timeout
+    if (Date.now() - startTime > timeoutMs) {
+      logError(`[VERIFY] Timeout fetching events for address ${address} after ${timeoutMs}ms (fetched ${page} pages)`);
+      break;
+    }
+
+    page++;
+    const filter: any = {
+      from_block: { block_number: fromBlock },
+      to_block: { block_number: toBlock },
+      // In Starknet getEvents, "address" is the emitting contract/account ("from_address" in returned events)
+      address,
+      keys: [],
+      chunk_size: 1000,
+    };
+    if (continuationToken) filter.continuation_token = continuationToken;
+
+    const result: any = await rpcRequestWithRetry('starknet_getEvents', [filter]);
+    const batch: StarknetEvent[] = Array.isArray(result?.events) ? result.events : [];
+    events.push(...batch);
+
+    // Optimization 2: Early exit if first page is empty (no events found)
+    if (page === 1 && batch.length === 0) {
+      logSensitive(`[VERIFY] No events found for ${address} on first page, skipping further pagination`);
+      break;
+    }
+
+    continuationToken = result?.continuation_token;
+    if (!continuationToken) break;
+  }
+
+  if (page >= maxPages) {
+    logError(`[VERIFY] Hit MAX_PAGES=${maxPages} paginating getEvents for address ${address}`);
+  }
+
+  return events;
+}
+
+function createConcurrencyLimiter(concurrency: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  const next = () => {
+    if (active >= concurrency) return;
+    const job = queue.shift();
+    if (!job) return;
+    active++;
+    job();
+  };
+
+  return async function limit<T>(fn: () => Promise<T>): Promise<T> {
+    return await new Promise<T>((resolve, reject) => {
+      queue.push(async () => {
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (e) {
+          reject(e);
+        } finally {
+          active--;
+          next();
+        }
+      });
+      next();
+    });
+  };
+}
+
+/**
+ * Process referrals and update their game counts using accumulative SQL increments
+ * Uses RPC function to atomically increment games_played and update last_checked_block
+ *
+ * User-activity + calldata verification strategy:
+ * - newGameCountByReferee: map referee_address -> delta count computed from tx calldata matches
+ * - latestBlockNumber is fetched ONCE at the start of the run and used for all rows' new_block pointer
+ */
+async function processReferrals(
+  referrals: ReferralRow[],
+  isUnverified: boolean,
+  newGameCountByReferee: Map<string, number>,
+  latestBlockNumber: number,
+  concurrency: number = 10
+): Promise<{ updated: number; newlyVerified: number }> {
+  const status = isUnverified ? 'unverified' : 'verified';
+  const limit = createConcurrencyLimiter(concurrency);
+
+  const results = await Promise.all(
+    referrals.map((referral, idx) =>
+      limit(async () => {
+        const lastCheckedBlockRaw = referral.last_checked_block || 0;
+        const currentGamesPlayed = referral.games_played || 0;
+        const effectiveLastCheckedBlock = lastCheckedBlockRaw;
+
+        logSensitive(
+          `[VERIFY] [${idx + 1}/${referrals.length}] Checking ${status} referral ID: ${referral.id}, Address: ${referral.referee_address}, Last checked block: ${lastCheckedBlockRaw}, Effective last: ${effectiveLastCheckedBlock}, Current games: ${currentGamesPlayed}`
+        );
+
+        const normalizedReferee = normalizeFeltHex(referral.referee_address);
+        const newGameCount = normalizedReferee ? (newGameCountByReferee.get(normalizedReferee) || 0) : 0;
+        const newLastCheckedBlock = latestBlockNumber;
+
+        // Always update last_checked_block, even if 0 new games found (to move pointer forward)
+        // Use SQL increment to atomically add new games to existing count
+        try {
+          const { error: rpcError } = await supabaseAdmin.rpc('increment_game_count', {
+            row_id: referral.id,
+            new_games: newGameCount,
+            new_block: newLastCheckedBlock,
+          });
+
+          if (rpcError) {
+            logError(`[VERIFY] Error calling increment_game_count for referral ${referral.id}:`, rpcError);
+            return { updated: 0, newlyVerified: 0 };
+          }
+
+          // Calculate new cumulative total (for logging)
+          const newCumulativeTotal = currentGamesPlayed + newGameCount;
+
+          // Note: has_played is automatically set by the SQL function if cumulative games_played > 0
+          // Check if this referral was just verified (unverified -> has games now)
+          const wasJustVerified = isUnverified && newCumulativeTotal > 0 && !referral.has_played;
+
+          if (newGameCount > 0) {
+            if (wasJustVerified) {
+              logSensitive(
+                `[VERIFY] ✓ Referral ${referral.id} verified - found ${newGameCount} new game(s), total: ${newCumulativeTotal}`
+              );
+              return { updated: 1, newlyVerified: 1 };
+            }
+
+            logSensitive(
+              `[VERIFY] ✓ Referral ${referral.id} updated - found ${newGameCount} new game(s), total: ${newCumulativeTotal}`
+            );
+            return { updated: 1, newlyVerified: 0 };
+          }
+
+          logSensitive(
+            `[VERIFY] ✗ Referral ${referral.id} - no new games since block ${effectiveLastCheckedBlock + 1} (pointer moved to ${newLastCheckedBlock})`
+          );
+          logSensitive(
+            `[VERIFY] ✓ Updated referral ${referral.id}: +${newGameCount} games (total: ${newCumulativeTotal}), last checked block: ${newLastCheckedBlock}`
+          );
+          return { updated: 0, newlyVerified: 0 };
+        } catch (error) {
+          logError(`[VERIFY] Error processing referral ${referral.id}:`, error);
+          return { updated: 0, newlyVerified: 0 };
+        }
+      })
+    )
+  );
+
+  return results.reduce(
+    (acc, r) => ({ updated: acc.updated + r.updated, newlyVerified: acc.newlyVerified + r.newlyVerified }),
+    { updated: 0, newlyVerified: 0 }
+  );
+}
+
+/**
+ * POST /api/verify
+ * Verify on-chain activity for referrals and update game counts
+ * This can be called manually or via a cron job
+ * Always updates game counts for all referrals, even if already verified
+ */
+export async function POST(request: NextRequest) {
+  // Dev-only logs; keep production quiet
+  logSensitive(`[VERIFY] ===== Starting verification process =====`);
+  try {
+    // Protect this endpoint: require a secret key (cron/admin-only).
+    // Accept either:
+    // - x-verify-key: <key>
+    // - authorization: Bearer <key>
+    const providedKey =
+      request.headers.get('x-verify-key') ||
+      (request.headers.get('authorization')?.startsWith('Bearer ')
+        ? request.headers.get('authorization')?.slice('Bearer '.length)
+        : null);
+
+    if (!VERIFY_API_KEY) {
+      if (!isDevelopment) {
+        return NextResponse.json(
+          { error: 'Server misconfigured: VERIFY_API_KEY is not set' },
+          { status: 500, headers: { 'Cache-Control': 'no-store' } }
+        );
+      }
+      // Dev fallback: allow without key to ease local iteration.
+    } else if (providedKey !== VERIFY_API_KEY) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+
+    // Parse batch parameters from query string or request body
+    const url = new URL(request.url);
+    const batchLimit = Number(url.searchParams.get('batch_limit') || process.env.VERIFY_BATCH_LIMIT || 100);
+    const batchOffset = Number(url.searchParams.get('batch_offset') || 0);
+    
+    logSensitive(`[VERIFY] Batch processing: limit=${batchLimit}, offset=${batchOffset}`);
+
+    // Rate limit (by IP) to reduce DDoS risk for unauthenticated callers.
+    // Skip rate limiting if API key is provided (already authenticated).
+    if (!providedKey || providedKey !== VERIFY_API_KEY) {
+      const ip = getClientIp(request);
+      const rl = rateLimit({ key: `verify:post:${ip}`, limit: 2, windowMs: 60_000 });
+      if (!rl.ok) {
+        return NextResponse.json(
+          { error: 'Rate limit exceeded' },
+          {
+            status: 429,
+            headers: {
+              'Cache-Control': 'no-store',
+              'Retry-After': String(Math.ceil((rl.resetAt - Date.now()) / 1000)),
+            },
+          }
+        );
+      }
+    }
+
+    // Ensure only one verification run happens per runtime at a time.
+    const g = globalThis as any;
+    if (g.__verifyInFlight) {
+      return NextResponse.json(
+        { error: 'Verification already running' },
+        { status: 409, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+    g.__verifyInFlight = true;
+
+    // Event-First Strategy Step 0: Fetch latest block height ONCE
+    logSensitive(`[VERIFY] Step 0: Fetching latest block number from Alchemy...`);
+    const latestBlockNumber = await getLatestBlockNumber();
+    logSensitive(
+      `[VERIFY] Latest block number: ${latestBlockNumber} (decimal), 0x${latestBlockNumber.toString(16)} (hex)`
+    );
+
+    // Step 1: Process unverified referrals with batching
+    logSensitive(`[VERIFY] Step 1: Fetching unverified referrals from Supabase...`);
+    const { data: unverifiedReferrals, error: unverifiedError } = await supabaseAdmin
+      .from('referrals')
+      .select('id, referee_address, created_at, has_played, last_checked_block, games_played')
+      .eq('has_played', false)
+      .order('last_checked_block', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: true })
+      .range(batchOffset, batchOffset + batchLimit - 1);
+
+    if (unverifiedError) {
+      logError(`[VERIFY] Error fetching unverified referrals:`, unverifiedError);
+      throw unverifiedError;
+    }
+
+    let unverifiedUpdated = 0;
+    let newlyVerified = 0;
+
+    // Step 2: Process verified referrals to update game counts with batching
+    logSensitive(`[VERIFY] Step 2: Fetching verified referrals to update game counts...`);
+    const { data: verifiedReferrals, error: verifiedError } = await supabaseAdmin
+      .from('referrals')
+      .select('id, referee_address, created_at, has_played, last_checked_block, games_played')
+      .eq('has_played', true)
+      .order('last_checked_block', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: true })
+      .range(batchOffset, batchOffset + batchLimit - 1);
+
+    if (verifiedError) {
+      logError(`[VERIFY] Error fetching verified referrals:`, verifiedError);
+      throw verifiedError;
+    }
+
+    const allReferrals: ReferralRow[] = [
+      ...(unverifiedReferrals || []),
+      ...(verifiedReferrals || []),
+    ];
+
+    let verifiedUpdated = 0;
+    let totalEvents = 0;
+    let totalUniqueTxs = 0;
+
+    if (allReferrals.length > 0) {
+      const normalizedReferees: string[] = [];
+      const lastCheckedByReferee = new Map<string, number>();
+      for (const r of allReferrals) {
+        const n = normalizeFeltHex(r.referee_address);
+        if (!n) continue;
+        normalizedReferees.push(n);
+        lastCheckedByReferee.set(n, r.last_checked_block || 0);
+      }
+
+      // Deduplicate addresses
+      const uniqueReferees = Array.from(new Set(normalizedReferees));
+
+      logSensitive(
+        `[VERIFY] Step 3: Broad event search for ${uniqueReferees.length} referees using per-address last_checked_block...`
+      );
+
+      // Chunk addresses into groups of 50 (as requested) and fetch per-address with concurrency
+      const ADDRESS_CHUNK = 50;
+      // Increased default concurrency from 3 to 5 for better throughput
+      const EVENT_CONCURRENCY = Number(process.env.VERIFY_EVENT_CONCURRENCY ?? 5);
+      const limitEvents = createConcurrencyLimiter(EVENT_CONCURRENCY);
+      
+      // Optimization: Skip addresses checked recently (within last N blocks)
+      const BLOCKS_TO_SKIP_RECENT = Number(process.env.VERIFY_SKIP_RECENT_BLOCKS ?? 100);
+      
+      // Add overall timeout check
+      const overallStartTime = Date.now();
+      const MAX_OVERALL_TIME_MS = 240_000; // 4 minutes
+
+      const activityPairs: Array<{ referee: string; blockNumber: number; txHash: string }> = [];
+      let missingTxHash = 0;
+      let missingBlockNumber = 0;
+
+      for (let i = 0; i < uniqueReferees.length; i += ADDRESS_CHUNK) {
+        // Check overall timeout
+        if (Date.now() - overallStartTime > MAX_OVERALL_TIME_MS) {
+          logError(`[VERIFY] Overall timeout reached, stopping event fetching`);
+          break;
+        }
+
+        const chunk = uniqueReferees.slice(i, i + ADDRESS_CHUNK);
+        logSensitive(`[VERIFY] Step 3: Scanning referee chunk ${i / ADDRESS_CHUNK + 1}/${Math.ceil(uniqueReferees.length / ADDRESS_CHUNK)} (${chunk.length} addresses)`);
+
+        const chunkResults = await Promise.all(
+          chunk.map(referee =>
+            limitEvents(async () => {
+              try {
+                // Use per-address fromBlock instead of global min
+                const lastChecked = lastCheckedByReferee.get(referee) || 0;
+                const fromBlock = Math.max(0, lastChecked);
+                
+                // Optimization 1: Skip if checked very recently (within last N blocks)
+                const blocksSinceLastCheck = latestBlockNumber - fromBlock;
+                if (blocksSinceLastCheck < BLOCKS_TO_SKIP_RECENT) {
+                  logSensitive(
+                    `[VERIFY] Skipping ${referee} - checked recently (${blocksSinceLastCheck} blocks ago, threshold: ${BLOCKS_TO_SKIP_RECENT})`
+                  );
+                  return { referee, events: [] as StarknetEvent[] };
+                }
+                
+                // Limit pages and add timeout per address
+                const events = await fetchEventsForAddress(
+                  referee, 
+                  fromBlock, 
+                  latestBlockNumber,
+                  { maxPages: 50, timeoutMs: 20_000 } // 50 pages max, 20s timeout per address
+                );
+                return { referee, events };
+              } catch (e) {
+                logError(`[VERIFY] Error fetching events for referee ${referee}:`, e);
+                return { referee, events: [] as StarknetEvent[] };
+              }
+            })
+          )
+        );
+
+        for (const { referee, events } of chunkResults) {
+          totalEvents += events.length;
+          const lastChecked = lastCheckedByReferee.get(referee) || 0;
+
+          for (const ev of events) {
+            const bn = parseBlockNumber((ev as any)?.block_number);
+            if (bn === null) {
+              missingBlockNumber++;
+              continue;
+            }
+            if (bn <= lastChecked) continue; // per-user delta gating
+
+            const txHash = typeof ev.transaction_hash === 'string' ? ev.transaction_hash : null;
+            if (!txHash) {
+              missingTxHash++;
+              continue;
+            }
+            const pair = { referee, blockNumber: bn, txHash };
+            activityPairs.push(pair);
+          }
+        }
+      }
+
+      // Step 4: Batch fetch transactions for only the hashes we saw in activity
+      const txHashes = Array.from(new Set(activityPairs.map(p => p.txHash)));
+      totalUniqueTxs = txHashes.length;
+      logSensitive(
+        `[VERIFY] Step 4: Fetching ${totalUniqueTxs} unique transactions for calldata verification...`,
+        { totalEvents, activityPairs: activityPairs.length, missingTxHash, missingBlockNumber }
+      );
+
+      const txMap = await batchGetTransactions(txHashes);
+      const selector = getStartGameSelector();
+
+      // Step 5: Calldata verification -> per-user newGameCount
+      const newGameCountByReferee = new Map<string, number>();
+      let matchedPairs = 0;
+
+      for (const pair of activityPairs) {
+        const tx = txMap.get(pair.txHash);
+        if (!txCalldataHasSelector(tx, selector)) continue;
+        matchedPairs++;
+        newGameCountByReferee.set(pair.referee, (newGameCountByReferee.get(pair.referee) || 0) + 1);
+      }
+
+      logSensitive(
+        `[VERIFY] Step 5: Selector matches found for ${newGameCountByReferee.size} referees`,
+        { matchedPairs }
+      );
+
+      // Step 6: Update DB in parallel (with concurrency limit) and move pointer for everyone
+      if (unverifiedReferrals && unverifiedReferrals.length > 0) {
+        logSensitive(`[VERIFY] Found ${unverifiedReferrals.length} unverified referrals to check`);
+        const result = await processReferrals(unverifiedReferrals, true, newGameCountByReferee, latestBlockNumber, 10);
+        unverifiedUpdated = result.updated;
+        newlyVerified = result.newlyVerified;
+      } else {
+        logSensitive(`[VERIFY] No unverified referrals found`);
+      }
+
+      if (verifiedReferrals && verifiedReferrals.length > 0) {
+        logSensitive(`[VERIFY] Found ${verifiedReferrals.length} verified referrals to update`);
+        const result = await processReferrals(verifiedReferrals, false, newGameCountByReferee, latestBlockNumber, 10);
+        verifiedUpdated = result.updated;
+      } else {
+        logSensitive(`[VERIFY] No verified referrals found`);
+      }
+    } else {
+      logSensitive(`[VERIFY] No referrals found`);
+    }
+
+    const totalUpdated = unverifiedUpdated + verifiedUpdated;
+    const totalProcessed = (unverifiedReferrals?.length || 0) + (verifiedReferrals?.length || 0);
+
+    // Step 7: Update missing usernames
+    logSensitive(`[VERIFY] Step 7: Checking for referrals without usernames...`);
+    let usernamesUpdated = 0;
+    
+    try {
+      const { data: referralsWithoutUsernames, error: usernameQueryError } = await supabaseAdmin
+        .from('referrals')
+        .select('id, referee_address, referrer_address, referee_username, referrer_username')
+        .or('referee_username.is.null,referrer_username.is.null');
+
+      if (usernameQueryError) {
+        logError('[VERIFY] Error fetching referrals without usernames:', usernameQueryError);
+      } else if (referralsWithoutUsernames && referralsWithoutUsernames.length > 0) {
+        logSensitive(`[VERIFY] Found ${referralsWithoutUsernames.length} referrals with missing usernames`);
+        
+        // Collect all unique addresses that need username lookup
+        const addressesToLookup = new Set<string>();
+        referralsWithoutUsernames.forEach(ref => {
+          if (!ref.referee_username && ref.referee_address) {
+            addressesToLookup.add(ref.referee_address.toLowerCase());
+          }
+          if (!ref.referrer_username && ref.referrer_address) {
+            addressesToLookup.add(ref.referrer_address.toLowerCase());
+          }
+        });
+
+        if (addressesToLookup.size > 0) {
+          logSensitive(`[VERIFY] Looking up usernames for ${addressesToLookup.size} addresses...`);
+          
+          try {
+            const addressMap = await lookupAddresses(Array.from(addressesToLookup));
+            logSensitive(`[VERIFY] Username lookup complete, found ${addressMap.size} usernames`);
+
+            // Create a normalized map for better matching
+            // The Cartridge API might return addresses without leading zeros
+            const normalizedMap = new Map<string, string>();
+            for (const [addr, username] of addressMap.entries()) {
+              // Store both original and normalized (with leading 0x but without zero padding)
+              const normalized = normalizeFeltHex(addr);
+              if (normalized) {
+                normalizedMap.set(normalized.toLowerCase(), username);
+              }
+              normalizedMap.set(addr.toLowerCase(), username);
+            }
+
+            logSensitive(`[VERIFY] Normalized ${normalizedMap.size} address mappings`);
+
+            // Update each referral with missing usernames in parallel (was sequential)
+            const USERNAME_UPDATE_CONCURRENCY = Number(process.env.VERIFY_USERNAME_UPDATE_CONCURRENCY ?? 5);
+            const limitUsernameUpdates = createConcurrencyLimiter(USERNAME_UPDATE_CONCURRENCY);
+
+            const usernameUpdateResults = await Promise.all(
+              referralsWithoutUsernames.map(ref =>
+                limitUsernameUpdates(async () => {
+                  const updates: { referee_username?: string; referrer_username?: string } = {};
+                  let needsUpdate = false;
+
+                  if (!ref.referee_username && ref.referee_address) {
+                    // Try both original and normalized versions
+                    const refAddr = ref.referee_address.toLowerCase();
+                    const refNorm = normalizeFeltHex(ref.referee_address);
+                    const username = normalizedMap.get(refAddr) || (refNorm ? normalizedMap.get(refNorm.toLowerCase()) : undefined);
+                    if (username) {
+                      updates.referee_username = username;
+                      needsUpdate = true;
+                      logSensitive(`[VERIFY] Matched referee username: ${username} for ${ref.referee_address}`);
+                    }
+                  }
+
+                  if (!ref.referrer_username && ref.referrer_address) {
+                    // Try both original and normalized versions
+                    const rerrAddr = ref.referrer_address.toLowerCase();
+                    const rerrNorm = normalizeFeltHex(ref.referrer_address);
+                    const username = normalizedMap.get(rerrAddr) || (rerrNorm ? normalizedMap.get(rerrNorm.toLowerCase()) : undefined);
+                    if (username) {
+                      updates.referrer_username = username;
+                      needsUpdate = true;
+                      logSensitive(`[VERIFY] Matched referrer username: ${username} for ${ref.referrer_address}`);
+                    }
+                  }
+
+                  if (needsUpdate) {
+                    const { error: updateError } = await supabaseAdmin
+                      .from('referrals')
+                      .update(updates)
+                      .eq('id', ref.id);
+
+                    if (updateError) {
+                      logError(`[VERIFY] Error updating usernames for referral ${ref.id}:`, updateError);
+                      return 0;
+                    } else {
+                      logSensitive(`[VERIFY] Updated usernames for referral ${ref.id}`);
+                      return 1;
+                    }
+                  }
+                  return 0;
+                })
+              )
+            );
+            usernamesUpdated = usernameUpdateResults.reduce((sum: number, count: number) => sum + count, 0);
+
+            logSensitive(`[VERIFY] Username update complete: ${usernamesUpdated} referrals updated`);
+          } catch (lookupError: any) {
+            logError('[VERIFY] Error during username lookup:', lookupError);
+          }
+        } else {
+          logSensitive(`[VERIFY] No addresses need username lookup`);
+        }
+      } else {
+        logSensitive(`[VERIFY] All referrals already have usernames`);
+      }
+    } catch (error: any) {
+      logError('[VERIFY] Error in username update step:', error);
+    }
+
+    const unverifiedCount = unverifiedReferrals?.length || 0;
+    const verifiedCount = verifiedReferrals?.length || 0;
+    // hasMore is true if either query returned a full batch (indicating more records exist)
+    const hasMore = unverifiedCount >= batchLimit || verifiedCount >= batchLimit;
+
+    const result = {
+      message: `Processed ${totalProcessed} referrals. Updated ${totalUpdated} game counts. ${newlyVerified} newly verified. ${usernamesUpdated} usernames updated.`,
+      newlyVerified,
+      updated: totalUpdated,
+      usernamesUpdated,
+      unverifiedProcessed: unverifiedCount,
+      verifiedProcessed: verifiedCount,
+      total: totalProcessed,
+      latestBlock: latestBlockNumber,
+      eventsScanned: totalEvents,
+      txsFetched: totalUniqueTxs,
+      batchLimit,
+      batchOffset,
+      hasMore, // Indicates if more batches needed
+    };
+    
+    logSensitive(`[VERIFY] ===== Verification complete =====`);
+    logSensitive(`[VERIFY] Result:`, result);
+    
+    return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store' } });
+  } catch (error: any) {
+    logError(`[VERIFY] ===== ERROR in verification process =====`);
+    logError(`[VERIFY] Error:`, error);
+    if (isDevelopment) {
+      console.error(`[VERIFY] Stack:`, error.stack);
+    }
+    return NextResponse.json(
+      { error: error.message || 'Internal server error' },
+      { status: 500, headers: { 'Cache-Control': 'no-store' } }
+    );
+  } finally {
+    const g = globalThis as any;
+    g.__verifyInFlight = false;
+  }
+}
+
+/**
+ * GET /api/verify
+ * Get verification status
+ */
+export async function GET() {
+  try {
+    // Light abuse protection for stats endpoint (still public).
+    // NextRequest isn't available in this signature; keep it cheap without IP-based limiting.
+    const { data: stats, error } = await supabaseAdmin
+      .from('referrals')
+      .select('has_played');
+
+    if (error) throw error;
+
+    const total = stats?.length || 0;
+    const verified = stats?.filter(s => s.has_played).length || 0;
+
+    return NextResponse.json({
+      total,
+      verified,
+      unverified: total - verified,
+    });
+  } catch (error: any) {
+    logError('Error getting verification stats:', error);
+    return NextResponse.json(
+      { error: error.message || 'Internal server error' },
+      { status: 500, headers: { 'Cache-Control': 'no-store' } }
+    );
+  }
+}

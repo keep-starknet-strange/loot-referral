@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Transcend Bold Font */
+@font-face {
+  font-family: 'Transcend Bold';
+  src: url('/fonts/transcend-regular-webfont.woff2') format('woff2'),
+       url('/fonts/transcend-regular-webfont.woff') format('woff');
+  font-weight: bold;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --background: #0a1a0f;
+  --foreground: #ededed;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: 'Transcend Bold', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-weight: bold;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Shine animation for button effect */
+@keyframes shine {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-shine {
+  animation: shine 2s infinite;
+}
+
+/* Ensure Cartridge Controller modal container is visible and properly styled */
+#controller {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 10000 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  cursor: pointer !important; /* Show pointer cursor on backdrop */
+}
+
+/* Allow modal to be hidden when closed */
+#controller[style*="display: none"],
+#controller[style*="display:none"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Ensure all interactive elements inside the controller modal are clickable */
+#controller > * {
+  pointer-events: auto !important;
+  position: relative;
+  z-index: 10001;
+  cursor: default !important; /* Reset cursor for iframe content */
+}
+
+/* Let Cartridge Controller handle iframe sizing naturally */
+iframe[id^="controller-"] {
+  position: relative !important;
+  border: none !important;
+  max-width: 90vw !important;
+  max-height: 90vh !important;
+  border-radius: 12px !important;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.2) !important;
+  background-color: white !important; /* Ensure iframe has background */
+  pointer-events: auto !important;
+  z-index: 10001 !important;
+}
+
+/* Ensure buttons and interactive elements in the iframe are clickable */
+iframe[id^="controller-"] * {
+  pointer-events: auto !important;
+}
+
+/* Make sure close buttons and overlays are clickable */
+#controller button,
+#controller [role="button"],
+#controller [data-close],
+#controller .close,
+#controller [aria-label*="close" i],
+#controller [aria-label*="Close" i] {
+  pointer-events: auto !important;
+  cursor: pointer !important;
+  z-index: 10002 !important;
+}
+
