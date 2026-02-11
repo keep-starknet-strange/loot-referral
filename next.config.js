@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // No CSP set here so the Cartridge Controller iframe can load. The font/Stripe
+  // CSP errors come from Cartridge’s iframe (api.cartridge.gg), not our app.
   webpack: (config, { isServer }) => {
     if (!isServer) {
       // Cartridge Controller loads WASM in an iframe from x.cartridge.gg

@@ -5,6 +5,7 @@ import { WalletConnection } from '@/components/WalletConnection';
 import { ReferralShare } from '@/components/ReferralShare';
 import { ReferralLeaderboard } from '@/components/ReferralLeaderboard';
 import { CompetitionCountdown } from '@/components/CompetitionCountdown';
+import { InviteCodeTicketClaimer } from '@/components/InviteCodeTicketClaimer';
 import { useReferral } from '@/hooks/useReferral';
 
 export default function Home() {
@@ -45,6 +46,10 @@ export default function Home() {
               walletAddress={walletAddress}
               isConnected={isWalletConnected}
             />
+            {/* Invite Code Ticket Claimer - below Share your referral link */}
+            <div className="mt-4 md:mt-6">
+              <InviteCodeTicketClaimer />
+            </div>
           </div>
 
           {/* Leaderboard */}
