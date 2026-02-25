@@ -9,7 +9,7 @@ const STARKNET_RPC_URL = process.env.STARKNET_RPC;
 const ALLOWED_ORIGINS = new Set<string>([
   'https://death-mountain-coral.vercel.app',
   'https://loot-referral.io',
-  'https://lootadventurer.xyz',
+  'https://www.lootadventurer.xyz',
   'http://localhost:3000',
 ]);
 
